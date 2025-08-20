@@ -1,15 +1,16 @@
+# netlify.toml — raíz del repo
 
 [build]
-  base = "bitacora-actividades-app"   # <-- tu subcarpeta con package.json
   command = "npm run build"
   publish = "dist"
 
 [functions]
-  directory = "netlify/functions"     # <-- relativo a esa base. Mueve las functions dentro de la base.
+  directory = "netlify/functions"
 
 [build.environment]
   NODE_VERSION = "20"
 
+# SPA: redirige cualquier ruta a index.html
 [[redirects]]
   from = "/*"
   to = "/index.html"
