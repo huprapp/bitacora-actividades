@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
-  PieChart, Pie, LineChart, Line, ResponsiveContainer
+  LineChart, Line, ResponsiveContainer
 } from "recharts";
 
 // ===================== CONFIG =====================
@@ -21,9 +21,9 @@ const DEFAULT_TASKS = [
   { key: "serviciosComunidad", label: "Servicios a la Comunidad" },
 ];
 
-const STORAGE_KEY = "bitacora_actividades_app_v3"; // nueva versión de almacenamiento
-const SETTINGS_KEY = "bitacora_settings_v1";
-const OUTBOX_KEY = "bitacora_outbox_v1"; // cola de envíos pendientes a la nube
+const STORAGE_KEY = "bitacora_actividades_app_v3"; // dataset local (opcional)
+const SETTINGS_KEY = "bitacora_settings_v1"; // prefs de la UI
+const OUTBOX_KEY = "bitacora_outbox_v1"; // cola offline para reintentos
 
 const parseN = (v) => {
   const n = Number(String(v ?? "").toString().replace(",", "."));
@@ -53,14 +53,14 @@ export default function App() {
   const [filterEnd, setFilterEnd] = useState("");
   const [filterPerson, setFilterPerson] = useState("");
 
-  // Ajustes de sincronización
+  // Ajustes y estado
   const [sheetsUrl, setSheetsUrl] = useState((import.meta.env && import.meta.env.VITE_SHEETS_URL) || "");
-  const [autoSync, setAutoSync] = useState(true);
+  const [autoSync, setAutoSync] = useState(true); // ON por defecto
   const [syncStatus, setSyncStatus] = useState("");
+  const usingProxy = true; // esta versión usa el proxy / Netlify Function
   const fileInputRef = useRef(null);
 
-  // ========= Cargar desde localStorage de manera SEGURA =========
-  // 1) Cargamos primero todo lo guardado (evita que un efecto de guardado inicial sobreescriba datos)
+  // ========= Cargar desde localStorage (si está disponible) =========
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
@@ -86,23 +86,21 @@ export default function App() {
     } catch {}
   }, []);
 
-  // 2) Guardado automático (solo después de que los estados se hayan montado)
+  // Guardado local (opcional)
   useEffect(() => {
-    const payload = { entries, current: { personName, date, notes, tasks, otros } };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    try {
+      const payload = { entries, current: { personName, date, notes, tasks, otros } };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch {}
   }, [entries, personName, date, notes, tasks, otros]);
 
   // Guardar ajustes
   useEffect(() => {
-    const s = { sheetsUrl, autoSync };
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+    try {
+      const s = { sheetsUrl, autoSync };
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+    } catch {}
   }, [sheetsUrl, autoSync]);
-
-  // Reintento de outbox cuando haya conexión o al cargar
-  useEffect(() => {
-    retryOutbox();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sheetsUrl]);
 
   // ========= Acciones de formulario =========
   const handleTaskChange = (key, field, value) => {
@@ -127,12 +125,12 @@ export default function App() {
   const saveEntry = async () => {
     if (!personName || !date) { alert("Por favor complete Nombre del Responsable y Fecha."); return; }
     const newEntry = { id: uuid(), personName, date, notes, tasks, otros, total: currentTotals.total, createdAt: new Date().toISOString() };
-    setEntries((prev) => [...prev, newEntry]);
-    setNotes("");
-    setTasks(Object.fromEntries(DEFAULT_TASKS.map((t) => [t.key, { description: "", quantity: "" }])));
-    setOtros([{ label: "Otros", description: "", quantity: "" }]);
 
-    if (sheetsUrl && autoSync) {
+    // 1) Guardar local (si el navegador lo permite)
+    setEntries((prev) => [...prev, newEntry]);
+
+    // 2) Enviar a la nube (proxy function)
+    if (autoSync) {
       try {
         await pushToSheets([newEntry]);
         setSyncStatus("✔ Enviado a la nube");
@@ -141,11 +139,57 @@ export default function App() {
         setSyncStatus("⚠ No se pudo enviar. Guardado en cola offline.");
       }
     }
+
+    // 3) Limpiar campos operativos (no borro nombre/fecha por UX, pero puedes hacerlo)
+    setNotes("");
+    setTasks(Object.fromEntries(DEFAULT_TASKS.map((t) => [t.key, { description: "", quantity: "" }])));
+    setOtros([{ label: "Otros", description: "", quantity: "" }]);
   };
 
   const deleteEntry = (id) => setEntries((p) => p.filter((e) => e.id !== id));
 
-  // ========= Reportes / Agregaciones =========
+  // ========= Sincronización (PROXY por Netlify Function) =========
+  const pushToSheets = async (items) => {
+    // Llamamos a la Function del mismo sitio: evita CORS y restricciones de dominio
+    const resp = await fetch('/.netlify/functions/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ type: 'bitacoras', entries: items })
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    // Si tu Apps Script responde JSON, podrías validar aquí:
+    // const data = await resp.json(); if (!data.ok) throw new Error('Apps Script error');
+    return true;
+  };
+
+  const queueOutbox = (items) => {
+    const prev = JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]");
+    const next = [...prev, ...items];
+    localStorage.setItem(OUTBOX_KEY, JSON.stringify(next));
+  };
+
+  const retryOutbox = async () => {
+    const q = JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]");
+    if (!q.length) { setSyncStatus("(No hay elementos en cola)"); return; }
+    try {
+      await pushToSheets(q);
+      localStorage.setItem(OUTBOX_KEY, JSON.stringify([]));
+      setSyncStatus("✔ Cola enviada");
+    } catch (e) {
+      setSyncStatus("❌ Error al enviar la cola (reintentará)");
+    }
+  };
+
+  const testSheets = async () => {
+    try {
+      await pushToSheets([{ id: "test", ping: true, at: new Date().toISOString() }]);
+      setSyncStatus("✔ Conexión OK (proxy)");
+    } catch (e) {
+      setSyncStatus("❌ Error de conexión (proxy)");
+    }
+  };
+
+  // ========= Agregaciones para Reporte =========
   const filteredEntries = useMemo(() => {
     return entries.filter((e) => {
       const matchPerson = filterPerson ? e.personName.toLowerCase().includes(filterPerson.toLowerCase()) : true;
@@ -154,30 +198,6 @@ export default function App() {
       return matchPerson && matchStart && matchEnd;
     });
   }, [entries, filterStart, filterEnd, filterPerson]);
-
-  const totalsByTask = useMemo(() => {
-    const acc = {};
-    DEFAULT_TASKS.forEach((t) => (acc[t.label] = 0));
-    for (const e of filteredEntries) {
-      for (const t of DEFAULT_TASKS) acc[t.label] += parseN(e.tasks?.[t.key]?.quantity);
-      for (const o of e.otros || []) acc[o.label || "Otros"] = (acc[o.label || "Otros"] || 0) + parseN(o.quantity);
-    }
-    return acc;
-  }, [filteredEntries]);
-
-  const barDataAll = useMemo(() => Object.entries(totalsByTask).map(([actividad, cantidad]) => ({ actividad, cantidad })).filter(d => d.cantidad>0), [totalsByTask]);
-
-  const totalsByPerson = useMemo(() => {
-    const acc = {};
-    for (const e of filteredEntries) {
-      const sumTasks = DEFAULT_TASKS.reduce((s, t) => s + parseN(e.tasks?.[t.key]?.quantity), 0);
-      const sumOtros = (e.otros || []).reduce((s, o) => s + parseN(o.quantity), 0);
-      acc[e.personName] = (acc[e.personName] || 0) + sumTasks + sumOtros;
-    }
-    return acc;
-  }, [filteredEntries]);
-
-  const personBarData = useMemo(() => Object.entries(totalsByPerson).map(([persona, total]) => ({ persona, total })).sort((a,b)=>b.total-a.total), [totalsByPerson]);
 
   const trendByDate = useMemo(() => {
     const acc = {};
@@ -195,7 +215,7 @@ export default function App() {
     rows.push(["Nombre del Responsable", "Fecha", "Actividad", "Descripción", "Cantidad", "Tipo"]);
     for (const e of entries) {
       for (const t of DEFAULT_TASKS) {
-        const te = e.tasks?.[t.key] || { description: "", quantity: "0" };
+        const te = e.tasks?.[t.key] || { description: "", quantity: "" };
         const qty = parseN(te.quantity);
         if (qty > 0 || te.description) rows.push([e.personName, e.date, t.label, (te.description || "").replace(/\n/g, "; "), String(qty), "Base"]);
       }
@@ -218,14 +238,9 @@ export default function App() {
     const text = await file.text();
     try {
       const data = JSON.parse(text);
-      if (Array.isArray(data)) {
-        // si viene como array directo
-        setEntries(data);
-      } else if (data && Array.isArray(data.entries)) {
-        setEntries(data.entries);
-      } else {
-        alert("Archivo JSON no válido");
-      }
+      if (Array.isArray(data)) setEntries(data);
+      else if (data && Array.isArray(data.entries)) setEntries(data.entries);
+      else alert("Archivo JSON no válido");
     } catch (e) {
       alert("No se pudo leer el JSON");
     }
@@ -237,48 +252,6 @@ export default function App() {
     const a = document.createElement("a");
     a.href = url; a.download = filename; a.click();
     URL.revokeObjectURL(url);
-  };
-
-  // ========= Sincronización con Google Sheets (Apps Script) =========
- const pushToSheets = async (items) => {
-  // Llamamos a la Function del mismo sitio (evita CORS y permisos de dominio)
-  const resp = await fetch('/.netlify/functions/submit', {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ type: 'bitacoras', entries: items })
-  })
-  if (!resp.ok) throw new Error('HTTP ' + resp.status)
-  // Si Apps Script devuelve JSON, puedes parsearlo:
-  // const data = await resp.json(); if (!data.ok) throw new Error('Apps Script error');
-  return true
-}
-
-
-  const queueOutbox = (items) => {
-    const prev = JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]");
-    const next = [...prev, ...items];
-    localStorage.setItem(OUTBOX_KEY, JSON.stringify(next));
-  };
-
-  const retryOutbox = async () => {
-    const q = JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]");
-    if (!q.length || !sheetsUrl) return;
-    try {
-      await pushToSheets(q);
-      localStorage.setItem(OUTBOX_KEY, JSON.stringify([]));
-      setSyncStatus("✔ Cola enviada");
-    } catch (e) {
-      setSyncStatus("⚠ Aún sin conexión al endpoint");
-    }
-  };
-
-  const testSheets = async () => {
-    try {
-      await pushToSheets([{ id: "test", ping: true, at: new Date().toISOString() }]);
-      setSyncStatus("✔ Conexión OK");
-    } catch (e) {
-      setSyncStatus("❌ Error de conexión");
-    }
   };
 
   // ===================== UI =====================
@@ -297,6 +270,7 @@ export default function App() {
           </div>
         </header>
 
+        {/* FORM */}
         {view === "form" && (
           <>
             <section className="bg-white rounded-2xl shadow p-4">
@@ -399,6 +373,7 @@ export default function App() {
           </>
         )}
 
+        {/* REPORT */}
         {view === "report" && (
           <>
             <section className="bg-white rounded-2xl shadow p-4">
@@ -407,20 +382,6 @@ export default function App() {
                 <div><label className="text-sm">Desde</label><input type="date" className="mt-1 w-full rounded-lg border p-2" value={filterStart} onChange={e=>setFilterStart(e.target.value)}/></div>
                 <div><label className="text-sm">Hasta</label><input type="date" className="mt-1 w-full rounded-lg border p-2" value={filterEnd} onChange={e=>setFilterEnd(e.target.value)}/></div>
                 <div className="md:col-span-2"><label className="text-sm">Responsable (contiene)</label><input className="mt-1 w-full rounded-lg border p-2" placeholder="Filtrar por nombre" value={filterPerson} onChange={e=>setFilterPerson(e.target.value)}/></div>
-              </div>
-            </section>
-
-            <section className="bg-white rounded-2xl shadow p-4">
-              <h2 className="text-lg font-semibold mb-3">Resumen agregado</h2>
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                <KPI title="Total actividades" value={
-                  filteredEntries.reduce((sum, e) => sum + DEFAULT_TASKS.reduce((s,t)=>s+parseN(e.tasks?.[t.key]?.quantity),0) + (e.otros||[]).reduce((s,o)=>s+parseN(o.quantity),0), 0)
-                }/>
-                <KPI title="Total responsables" value={new Set(filteredEntries.map(e=>e.personName)).size}/>
-                <div className="rounded-2xl border bg-white p-4">
-                  <p className="text-sm text-gray-600">Rango de fechas</p>
-                  <p className="text-sm">{filterStart || "(inicio)"} — {filterEnd || "(fin)"}</p>
-                </div>
               </div>
             </section>
 
@@ -513,15 +474,16 @@ export default function App() {
           </>
         )}
 
+        {/* SETTINGS */}
         {view === "settings" && (
           <>
             <section className="bg-white rounded-2xl shadow p-4">
               <h2 className="text-lg font-semibold mb-3">Ajustes y Sincronización</h2>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="text-sm">URL de Google Apps Script (Web App)</label>
-                  <input className="mt-1 w-full rounded-lg border p-2" placeholder="Pega aquí la URL del despliegue" value={sheetsUrl} onChange={e=>setSheetsUrl(e.target.value)} />
-                  <p className="text-xs text-gray-500 mt-1">Se usará para enviar copias a Google Sheets.</p>
+                  <label className="text-sm">URL de Google Apps Script (informativa)</label>
+                  <input className="mt-1 w-full rounded-lg border p-2" placeholder="(opcional)" value={sheetsUrl} onChange={e=>setSheetsUrl(e.target.value)} />
+                  <p className="text-xs text-gray-500 mt-1">Esta versión envía usando un <strong>proxy del sitio</strong> (Netlify Function). Este campo es informativo.</p>
                 </div>
                 <div className="flex items-end gap-2">
                   <button className="px-3 py-2 rounded-xl border bg-white" onClick={testSheets}>Probar conexión</button>
@@ -532,7 +494,7 @@ export default function App() {
                   <label htmlFor="autosync">Sincronizar automáticamente al Guardar bitácora</label>
                 </div>
                 <div className="col-span-1">
-                  <p className="text-xs text-gray-600">Estado: {syncStatus || "(sin pruebas aún)"}</p>
+                  <p className="text-xs text-gray-600">Estado: {syncStatus || "(sin pruebas aún)"} {usingProxy && "· (Envío vía proxy)"}</p>
                 </div>
               </div>
             </section>
@@ -544,7 +506,7 @@ export default function App() {
                 <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e)=>{const f=e.target.files?.[0]; if (f) importJSON(f); e.target.value='';}} />
                 <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>fileInputRef.current?.click()}>Importar respaldo (JSON)</button>
               </div>
-              <p className="text-xs text-gray-500 mt-2">Nota: si se borra el almacenamiento del navegador, los datos locales se pierden. Use la sincronización con Sheets o exporte respaldos.</p>
+              <p className="text-xs text-gray-500 mt-2">Si el navegador borra datos locales, use la sincronización (proxy) o exporte respaldos.</p>
             </section>
           </>
         )}
