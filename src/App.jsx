@@ -1,10 +1,11 @@
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   PieChart, Pie, LineChart, Line, ResponsiveContainer
 } from "recharts";
 
+// ===================== CONFIG =====================
 const DEFAULT_TASKS = [
   { key: "actividadesEducativas", label: "Actividades Educativas" },
   { key: "evalInicialAdultos", label: "Evaluaciones Iniciales – Adultos" },
@@ -21,7 +22,9 @@ const DEFAULT_TASKS = [
   { key: "serviciosComunidad", label: "Servicios a la Comunidad" },
 ];
 
-const STORAGE_KEY = "bitacora_actividades_app_v2";
+const STORAGE_KEY = "bitacora_actividades_app_v3"; // nueva versión de almacenamiento
+const SETTINGS_KEY = "bitacora_settings_v1";
+const OUTBOX_KEY = "bitacora_outbox_v1"; // cola de envíos pendientes a la nube
 
 const parseN = (v) => {
   const n = Number(String(v ?? "").toString().replace(",", "."));
@@ -29,7 +32,9 @@ const parseN = (v) => {
 };
 const uuid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
+// ===================== APP =====================
 export default function App() {
+  // Form actual (una bitácora a la vez)
   const [personName, setPersonName] = useState("");
   const [date, setDate] = useState("");
   const [notes, setNotes] = useState("");
@@ -38,37 +43,69 @@ export default function App() {
   );
   const [otros, setOtros] = useState([{ label: "Otros", description: "", quantity: "" }]);
 
+  // Dataset histórico (múltiples días/personas)
   const [entries, setEntries] = useState([]);
-  const [view, setView] = useState("form"); // "form" | "report"
 
-  // Report filters
+  // Vista
+  const [view, setView] = useState("form"); // "form" | "report" | "settings"
+
+  // Filtros del reporte
   const [filterStart, setFilterStart] = useState("");
   const [filterEnd, setFilterEnd] = useState("");
   const [filterPerson, setFilterPerson] = useState("");
 
+  // Ajustes de sincronización
+  const [sheetsUrl, setSheetsUrl] = useState((import.meta.env && import.meta.env.VITE_SHEETS_URL) || "");
+  const [autoSync, setAutoSync] = useState(true);
+  const [syncStatus, setSyncStatus] = useState("");
+  const fileInputRef = useRef(null);
+
+  // ========= Cargar desde localStorage de manera SEGURA =========
+  // 1) Cargamos primero todo lo guardado (evita que un efecto de guardado inicial sobreescriba datos)
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
-        const data = JSON.parse(saved);
-        setEntries(data.entries || []);
-        if (data.current) {
-          const c = data.current;
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+      if (saved) {
+        if (saved.entries) setEntries(saved.entries);
+        if (saved.current) {
+          const c = saved.current;
           setPersonName(c.personName || "");
           setDate(c.date || "");
           setNotes(c.notes || "");
           setTasks(c.tasks || Object.fromEntries(DEFAULT_TASKS.map((t) => [t.key, { description: "", quantity: "" }])));
           setOtros(c.otros || [{ label: "Otros", description: "", quantity: "" }]);
         }
-      } catch {}
-    }
+      }
+    } catch {}
+
+    try {
+      const settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "null");
+      if (settings) {
+        setSheetsUrl(settings.sheetsUrl ?? ((import.meta.env && import.meta.env.VITE_SHEETS_URL) || ""));
+        setAutoSync(settings.autoSync !== undefined ? !!settings.autoSync : true);
+      }
+    } catch {}
   }, []);
 
+  // 2) Guardado automático (solo después de que los estados se hayan montado)
   useEffect(() => {
     const payload = { entries, current: { personName, date, notes, tasks, otros } };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
   }, [entries, personName, date, notes, tasks, otros]);
 
+  // Guardar ajustes
+  useEffect(() => {
+    const s = { sheetsUrl, autoSync };
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  }, [sheetsUrl, autoSync]);
+
+  // Reintento de outbox cuando haya conexión o al cargar
+  useEffect(() => {
+    retryOutbox();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sheetsUrl]);
+
+  // ========= Acciones de formulario =========
   const handleTaskChange = (key, field, value) => {
     setTasks((prev) => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
   };
@@ -82,17 +119,34 @@ export default function App() {
     setOtros([{ label: "Otros", description: "", quantity: "" }]);
   };
 
-  const saveEntry = () => {
+  const currentTotals = useMemo(() => {
+    const base = DEFAULT_TASKS.reduce((acc, t) => acc + parseN(tasks[t.key]?.quantity), 0);
+    const others = otros.reduce((acc, o) => acc + parseN(o.quantity), 0);
+    return { base, others, total: base + others };
+  }, [tasks, otros]);
+
+  const saveEntry = async () => {
     if (!personName || !date) { alert("Por favor complete Nombre del Responsable y Fecha."); return; }
-    const newEntry = { id: uuid(), personName, date, notes, tasks, otros };
+    const newEntry = { id: uuid(), personName, date, notes, tasks, otros, total: currentTotals.total, createdAt: new Date().toISOString() };
     setEntries((prev) => [...prev, newEntry]);
     setNotes("");
     setTasks(Object.fromEntries(DEFAULT_TASKS.map((t) => [t.key, { description: "", quantity: "" }])));
     setOtros([{ label: "Otros", description: "", quantity: "" }]);
+
+    if (sheetsUrl && autoSync) {
+      try {
+        await pushToSheets([newEntry]);
+        setSyncStatus("✔ Enviado a la nube");
+      } catch (e) {
+        queueOutbox([newEntry]);
+        setSyncStatus("⚠ No se pudo enviar. Guardado en cola offline.");
+      }
+    }
   };
+
   const deleteEntry = (id) => setEntries((p) => p.filter((e) => e.id !== id));
 
-  // Aggregations
+  // ========= Reportes / Agregaciones =========
   const filteredEntries = useMemo(() => {
     return entries.filter((e) => {
       const matchPerson = filterPerson ? e.personName.toLowerCase().includes(filterPerson.toLowerCase()) : true;
@@ -136,12 +190,7 @@ export default function App() {
     return Object.entries(acc).map(([fecha, total]) => ({ fecha, total })).sort((a,b)=>a.fecha<b.fecha?-1:1);
   }, [filteredEntries]);
 
-  const currentTotals = useMemo(() => {
-    const base = DEFAULT_TASKS.reduce((acc, t) => acc + parseN(tasks[t.key]?.quantity), 0);
-    const others = otros.reduce((acc, o) => acc + parseN(o.quantity), 0);
-    return { base, others, total: base + others };
-  }, [tasks, otros]);
-
+  // ========= Exportar / Importar =========
   const exportCSVEntries = () => {
     const rows = [];
     rows.push(["Nombre del Responsable", "Fecha", "Actividad", "Descripción", "Cantidad", "Tipo"]);
@@ -149,59 +198,106 @@ export default function App() {
       for (const t of DEFAULT_TASKS) {
         const te = e.tasks?.[t.key] || { description: "", quantity: "0" };
         const qty = parseN(te.quantity);
-        if (qty > 0 || te.description) rows.push([e.personName, e.date, t.label, (te.description || "").replace(/\\n/g, "; "), String(qty), "Base"]);
+        if (qty > 0 || te.description) rows.push([e.personName, e.date, t.label, (te.description || "").replace(/\n/g, "; "), String(qty), "Base"]);
       }
       for (const o of e.otros || []) {
         const qty = parseN(o.quantity);
-        if (qty > 0 || o.description) rows.push([e.personName, e.date, o.label || "Otros", (o.description || "").replace(/\\n/g, "; "), String(qty), "Otros"]);
+        if (qty > 0 || o.description) rows.push([e.personName, e.date, o.label || "Otros", (o.description || "").replace(/\n/g, "; "), String(qty), "Otros"]);
       }
     }
-    const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+    downloadBlob(csv, "text/csv;charset=utf-8;", "Bitacoras_Completas.csv");
+  };
+
+  const exportJSON = () => {
+    const payload = { entries };
+    downloadBlob(JSON.stringify(payload, null, 2), "application/json", `bitacoras_backup_${new Date().toISOString().slice(0,10)}.json`);
+  };
+
+  const importJSON = async (file) => {
+    if (!file) return;
+    const text = await file.text();
+    try {
+      const data = JSON.parse(text);
+      if (Array.isArray(data)) {
+        // si viene como array directo
+        setEntries(data);
+      } else if (data && Array.isArray(data.entries)) {
+        setEntries(data.entries);
+      } else {
+        alert("Archivo JSON no válido");
+      }
+    } catch (e) {
+      alert("No se pudo leer el JSON");
+    }
+  };
+
+  const downloadBlob = (content, type, filename) => {
+    const blob = new Blob([content], { type });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = "Bitacoras_Completas.csv"; a.click();
+    a.href = url; a.download = filename; a.click();
     URL.revokeObjectURL(url);
   };
 
-  const exportCSVCurrent = () => {
-    const rows = [];
-    rows.push(["Nombre del Responsable", personName]);
-    rows.push(["Fecha", date]);
-    rows.push([""]);
-    rows.push(["Actividad", "Descripción", "Cantidad"]);
-    DEFAULT_TASKS.forEach((t) => {
-      const { description, quantity } = tasks[t.key] || {};
-      rows.push([t.label, (description || "").replace(/\\n/g, "; "), quantity || "0"]);
+  // ========= Sincronización con Google Sheets (Apps Script) =========
+  const pushToSheets = async (items) => {
+    if (!sheetsUrl) throw new Error("No hay URL de Google Sheets configurada");
+    const resp = await fetch(sheetsUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "bitacoras", entries: items })
     });
-    otros.forEach((o) => rows.push([o.label || "Otros", (o.description || "").replace(/\\n/g, "; "), o.quantity || "0"]));
-    rows.push([""]);
-    rows.push(["TOTAL", "", String(currentTotals.total)]);
-    const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = `Bitacora_${personName || "responsable"}_${date || "fecha"}.csv`; a.click();
-    URL.revokeObjectURL(url);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json().catch(() => ({}));
+    if (data && data.ok === true) return true;
+    return true; // asumimos éxito si no hay formato específico
   };
 
-  const printPage = () => window.print();
+  const queueOutbox = (items) => {
+    const prev = JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]");
+    const next = [...prev, ...items];
+    localStorage.setItem(OUTBOX_KEY, JSON.stringify(next));
+  };
 
+  const retryOutbox = async () => {
+    const q = JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]");
+    if (!q.length || !sheetsUrl) return;
+    try {
+      await pushToSheets(q);
+      localStorage.setItem(OUTBOX_KEY, JSON.stringify([]));
+      setSyncStatus("✔ Cola enviada");
+    } catch (e) {
+      setSyncStatus("⚠ Aún sin conexión al endpoint");
+    }
+  };
+
+  const testSheets = async () => {
+    try {
+      await pushToSheets([{ id: "test", ping: true, at: new Date().toISOString() }]);
+      setSyncStatus("✔ Conexión OK");
+    } catch (e) {
+      setSyncStatus("❌ Error de conexión");
+    }
+  };
+
+  // ===================== UI =====================
   return (
     <div className="min-h-screen w-full bg-gray-50 p-4 md:p-8">
       <div className="mx-auto max-w-7xl space-y-6">
         <header className="flex items-center justify-between gap-4">
           <div>
             <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">Hospital UPR Dr. Federico Trilla</h1>
-            <p className="text-sm md:text-base text-gray-600">Bitácora de Actividades (General)</p>
+            <p className="text-sm md:text-base text-gray-600">Bitácora de Actividades (General) — con respaldo y sincronización</p>
           </div>
           <div className="flex gap-2">
             <button className={`px-3 py-2 rounded-xl border ${view==="form"?"bg-blue-600 text-white":"bg-white"}`} onClick={()=>setView("form")}>Formulario</button>
-            <button className={`px-3 py-2 rounded-xl border ${view==="report"?"bg-blue-600 text-white":"bg-white"}`} onClick={()=>setView("report")}>Reporte Ejecutivo</button>
+            <button className={`px-3 py-2 rounded-xl border ${view==="report"?"bg-blue-600 text-white":"bg-white"}`} onClick={()=>setView("report")}>Reporte</button>
+            <button className={`px-3 py-2 rounded-xl border ${view==="settings"?"bg-blue-600 text-white":"bg-white"}`} onClick={()=>setView("settings")}>Ajustes</button>
           </div>
         </header>
 
-        {view === "form" ? (
+        {view === "form" && (
           <>
             <section className="bg-white rounded-2xl shadow p-4">
               <h2 className="text-lg font-semibold mb-3">Datos del Registro</h2>
@@ -259,11 +355,13 @@ export default function App() {
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                   <KPI title="Total (Base)" value={DEFAULT_TASKS.reduce((acc,t)=>acc+parseN(tasks[t.key]?.quantity),0)} />
                   <KPI title="Total (Otros)" value={otros.reduce((acc,o)=>acc+parseN(o.quantity),0)} />
-                  <KPI title="TOTAL REGISTRO" value={DEFAULT_TASKS.reduce((acc,t)=>acc+parseN(tasks[t.key]?.quantity),0)+otros.reduce((acc,o)=>acc+parseN(o.quantity),0)} />
+                  <KPI title="TOTAL REGISTRO" value={currentTotals.total} />
                   <div className="rounded-2xl border bg-white p-4 flex items-center justify-center">
                     <button className="px-3 py-2 rounded-xl border bg-blue-600 text-white w-full" onClick={saveEntry}>Guardar bitácora</button>
                   </div>
                 </div>
+
+                <p className="text-xs text-gray-600">{syncStatus}</p>
               </div>
             </section>
 
@@ -274,8 +372,11 @@ export default function App() {
 
             <div className="flex flex-wrap gap-2">
               <button className="px-3 py-2 rounded-xl border bg-white" onClick={resetForm}>Limpiar</button>
-              <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>exportCSVCurrent()}>Exportar CSV (registro)</button>
+              <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>exportJSON()}>Exportar respaldo (JSON)</button>
+              <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>exportCSVEntries()}>Exportar CSV (todas)</button>
               <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>window.print()}>Imprimir</button>
+              <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e)=>{const f=e.target.files?.[0]; if (f) importJSON(f); e.target.value='';}} />
+              <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>fileInputRef.current?.click()}>Importar respaldo (JSON)</button>
             </div>
 
             {entries.length>0 && (
@@ -286,20 +387,19 @@ export default function App() {
                     <div key={e.id} className="grid grid-cols-12 gap-2 items-center border rounded-xl p-3">
                       <div className="col-span-12 md:col-span-4 text-sm"><span className="font-medium">{e.personName}</span></div>
                       <div className="col-span-6 md:col-span-3 text-sm">{e.date}</div>
-                      <div className="col-span-4 md:col-span-3 text-sm">
-                        Total: {DEFAULT_TASKS.reduce((s,t)=>s+parseN(e.tasks?.[t.key]?.quantity),0) + (e.otros||[]).reduce((s,o)=>s+parseN(o.quantity),0)}
-                      </div>
+                      <div className="col-span-4 md:col-span-3 text-sm">Total: {e.total ?? (DEFAULT_TASKS.reduce((s,t)=>s+parseN(e.tasks?.[t.key]?.quantity),0) + (e.otros||[]).reduce((s,o)=>s+parseN(o.quantity),0))}</div>
                       <div className="col-span-2 md:col-span-2 text-right">
                         <button className="text-red-600 underline" onClick={()=>deleteEntry(e.id)}>Eliminar</button>
                       </div>
                     </div>
                   ))}
-                  <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>exportCSVEntries()}>Exportar CSV (todas)</button>
                 </div>
               </section>
             )}
           </>
-        ) : (
+        )}
+
+        {view === "report" && (
           <>
             <section className="bg-white rounded-2xl shadow p-4">
               <h2 className="text-lg font-semibold mb-3">Filtros del Reporte</h2>
@@ -327,7 +427,10 @@ export default function App() {
             <section className="bg-white rounded-2xl shadow p-4" style={{height: 360}}>
               <h2 className="text-lg font-semibold mb-3">Actividades por categoría (todas las bitácoras)</h2>
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={barDataAll} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                <BarChart data={Object.entries(filteredEntries.length? filteredEntries.reduce((acc,e)=>{
+                  for (const t of DEFAULT_TASKS) acc[t.label]=(acc[t.label]||0)+parseN(e.tasks?.[t.key]?.quantity);
+                  for (const o of e.otros||[]) acc[o.label||"Otros"]=(acc[o.label||"Otros"]||0)+parseN(o.quantity);
+                  return acc;}, {}):{}).map(([actividad,cantidad])=>({actividad, cantidad}))} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="actividad" tick={{ fontSize: 12 }} interval={0} angle={-20} textAnchor="end" height={70} />
                   <YAxis allowDecimals={false} />
@@ -342,7 +445,7 @@ export default function App() {
               <section className="bg-white rounded-2xl shadow p-4" style={{height: 320}}>
                 <h2 className="text-lg font-semibold mb-3">Actividades por responsable</h2>
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={personBarData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                  <BarChart data={Object.entries(filteredEntries.reduce((acc,e)=>{const total=DEFAULT_TASKS.reduce((s,t)=>s+parseN(e.tasks?.[t.key]?.quantity),0)+(e.otros||[]).reduce((s,o)=>s+parseN(o.quantity),0); acc[e.personName]=(acc[e.personName]||0)+total; return acc;},{})).map(([persona,total])=>({persona, total})).sort((a,b)=>b.total-a.total)} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis dataKey="persona" tick={{ fontSize: 12 }} interval={0} angle={-10} textAnchor="end" height={50} />
                     <YAxis allowDecimals={false} />
@@ -405,7 +508,44 @@ export default function App() {
               <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>setView("form")}>Volver al formulario</button>
               <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>window.print()}>Imprimir reporte</button>
               <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>exportCSVEntries()}>Exportar CSV (todas)</button>
+              <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>exportJSON()}>Exportar respaldo (JSON)</button>
             </div>
+          </>
+        )}
+
+        {view === "settings" && (
+          <>
+            <section className="bg-white rounded-2xl shadow p-4">
+              <h2 className="text-lg font-semibold mb-3">Ajustes y Sincronización</h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-sm">URL de Google Apps Script (Web App)</label>
+                  <input className="mt-1 w-full rounded-lg border p-2" placeholder="Pega aquí la URL del despliegue" value={sheetsUrl} onChange={e=>setSheetsUrl(e.target.value)} />
+                  <p className="text-xs text-gray-500 mt-1">Se usará para enviar copias a Google Sheets.</p>
+                </div>
+                <div className="flex items-end gap-2">
+                  <button className="px-3 py-2 rounded-xl border bg-white" onClick={testSheets}>Probar conexión</button>
+                  <button className="px-3 py-2 rounded-xl border bg-white" onClick={retryOutbox}>Enviar cola pendiente</button>
+                </div>
+                <div className="col-span-1 flex items-center gap-2">
+                  <input id="autosync" type="checkbox" checked={autoSync} onChange={(e)=>setAutoSync(e.target.checked)} />
+                  <label htmlFor="autosync">Sincronizar automáticamente al Guardar bitácora</label>
+                </div>
+                <div className="col-span-1">
+                  <p className="text-xs text-gray-600">Estado: {syncStatus || "(sin pruebas aún)"}</p>
+                </div>
+              </div>
+            </section>
+
+            <section className="bg-white rounded-2xl shadow p-4">
+              <h3 className="text-base font-semibold mb-2">Respaldos locales</h3>
+              <div className="flex flex-wrap gap-2">
+                <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>exportJSON()}>Exportar respaldo (JSON)</button>
+                <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e)=>{const f=e.target.files?.[0]; if (f) importJSON(f); e.target.value='';}} />
+                <button className="px-3 py-2 rounded-xl border bg-white" onClick={()=>fileInputRef.current?.click()}>Importar respaldo (JSON)</button>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">Nota: si se borra el almacenamiento del navegador, los datos locales se pierden. Use la sincronización con Sheets o exporte respaldos.</p>
+            </section>
           </>
         )}
       </div>
