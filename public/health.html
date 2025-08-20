@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Health Check</title>
+</head>
+<body>
+  <h1>Health Check</h1>
+
+  <button id="ping">Ping Function (GET)</button>
+  <pre id="pingOut"></pre>
+
+  <button id="send">Enviar prueba (POST)</button>
+  <pre id="sendOut"></pre>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    $('ping').onclick = async () => {
+      $('pingOut').textContent = '...';
+      try {
+        const r = await fetch('/.netlify/functions/submit', { method: 'GET' });
+        const t = await r.text();
+        $('pingOut').textContent = t;
+      } catch (e) {
+        $('pingOut').textContent = 'ERROR: ' + e;
+      }
+    };
+
+    $('send').onclick = async () => {
+      $('sendOut').textContent = '...';
+      const payload = {
+        type: 'bitacoras',
+        entries: [{ id: 'health-test', personName: 'Health Check', date: '2025-08-20', total: 1, notes: 'ok', tasks: {}, otros: [], createdAt: new Date().toISOString() }]
+      };
+      try {
+        const r = await fetch('/.netlify/functions/submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(payload),
+        });
+        const t = await r.text();
+        $('sendOut').textContent = t;
+      } catch (e) {
+        $('sendOut').textContent = 'ERROR: ' + e;
+      }
+    };
+  </script>
+</body>
+</html>
