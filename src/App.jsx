@@ -1,4 +1,3 @@
-
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
@@ -243,9 +242,10 @@ export default function App() {
   // ========= Sincronización con Google Sheets (Apps Script) =========
   const pushToSheets = async (items) => {
     if (!sheetsUrl) throw new Error("No hay URL de Google Sheets configurada");
+    // Usamos 'text/plain' para evitar preflight CORS en Apps Script
     const resp = await fetch(sheetsUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify({ type: "bitacoras", entries: items })
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
