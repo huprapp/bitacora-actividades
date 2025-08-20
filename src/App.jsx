@@ -240,19 +240,19 @@ export default function App() {
   };
 
   // ========= Sincronización con Google Sheets (Apps Script) =========
-  const pushToSheets = async (items) => {
-    if (!sheetsUrl) throw new Error("No hay URL de Google Sheets configurada");
-    // Usamos 'text/plain' para evitar preflight CORS en Apps Script
-    const resp = await fetch(sheetsUrl, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ type: "bitacoras", entries: items })
-    });
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    const data = await resp.json().catch(() => ({}));
-    if (data && data.ok === true) return true;
-    return true; // asumimos éxito si no hay formato específico
-  };
+ const pushToSheets = async (items) => {
+  // Llamamos a la Function del mismo sitio (evita CORS y permisos de dominio)
+  const resp = await fetch('/.netlify/functions/submit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ type: 'bitacoras', entries: items })
+  })
+  if (!resp.ok) throw new Error('HTTP ' + resp.status)
+  // Si Apps Script devuelve JSON, puedes parsearlo:
+  // const data = await resp.json(); if (!data.ok) throw new Error('Apps Script error');
+  return true
+}
+
 
   const queueOutbox = (items) => {
     const prev = JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]");
