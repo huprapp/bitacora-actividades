@@ -189,6 +189,27 @@ export default function App() {
     }
   };
 
+  // Descargar registros desde la nube (Netlify Function → Apps Script)
+  const pullFromCloud = async (mode = 'merge') => {
+    setSyncStatus('⏬ Descargando de la nube…');
+    try {
+      const resp = await fetch('/.netlify/functions/submit?action=list&limit=5000', { method: 'GET' });
+      const data = await resp.json();
+      if (!data.ok || !Array.isArray(data.entries)) throw new Error('Respuesta inesperada');
+
+      if (mode === 'replace') {
+        setEntries(data.entries);
+      } else {
+        const map = new Map(entries.map(e => [e.id, e]));
+        for (const r of data.entries) map.set(r.id, r);
+        setEntries(Array.from(map.values()));
+      }
+      setSyncStatus(`✔ Cargado ${data.entries.length} registros de la nube`);
+    } catch (e) {
+      setSyncStatus('❌ Error al descargar de la nube');
+    }
+  };
+
   // ========= Agregaciones para Reporte =========
   const filteredEntries = useMemo(() => {
     return entries.filter((e) => {
@@ -485,11 +506,13 @@ export default function App() {
                   <input className="mt-1 w-full rounded-lg border p-2" placeholder="(opcional)" value={sheetsUrl} onChange={e=>setSheetsUrl(e.target.value)} />
                   <p className="text-xs text-gray-500 mt-1">Esta versión envía usando un <strong>proxy del sitio</strong> (Netlify Function). Este campo es informativo.</p>
                 </div>
-                <div className="flex items-end gap-2">
-                  <button className="px-3 py-2 rounded-xl border bg-white" onClick={testSheets}>Probar conexión</button>
-                  <button className="px-3 py-2 rounded-xl border bg-white" onClick={retryOutbox}>Enviar cola pendiente</button>
+                <div className=\"flex flex-wrap items-end gap-2\">
+                  <button className=\"px-3 py-2 rounded-xl border bg-white\" onClick={testSheets}>Probar conexión</button>
+                  <button className=\"px-3 py-2 rounded-xl border bg-white\" onClick={retryOutbox}>Enviar cola pendiente</button>
+                  <button className=\"px-3 py-2 rounded-xl border bg-white\" onClick={() => pullFromCloud('merge')}>Cargar desde la nube (combinar)</button>
+                  <button className=\"px-3 py-2 rounded-xl border bg-white\" onClick={() => pullFromCloud('replace')}>Reemplazar con la nube</button>
                 </div>
-                <div className="col-span-1 flex items-center gap-2">
+                <div className=\"col-span-1 flex items-center gap-2\">
                   <input id="autosync" type="checkbox" checked={autoSync} onChange={(e)=>setAutoSync(e.target.checked)} />
                   <label htmlFor="autosync">Sincronizar automáticamente al Guardar bitácora</label>
                 </div>
