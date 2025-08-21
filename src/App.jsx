@@ -21,8 +21,8 @@ const DEFAULT_TASKS = [
   { key: "serviciosComunidad", label: "Servicios a la Comunidad" },
 ];
 
-const STORAGE_KEY = "bitacora_actividades_app_v4"; // dataset local (opcional)
-const SETTINGS_KEY = "bitacora_settings_v2"; // prefs de la UI (con autoPull y password)
+const STORAGE_KEY = "bitacora_actividades_app_v5"; // dataset local (opcional)
+const SETTINGS_KEY = "bitacora_settings_v3"; // prefs de la UI (con autoPull, password y privacidad)
 const OUTBOX_KEY = "bitacora_outbox_v1"; // cola offline para reintentos
 
 // Seguridad sencilla para Ajustes
@@ -131,6 +131,11 @@ export default function App() {
   const [isSettingsUnlocked, setIsSettingsUnlocked] = useState(false);
   const [passInput, setPassInput] = useState("");
 
+  // Privacidad
+  const [hideTextDetail, setHideTextDetail] = useState(false); // oculta Descripción/Notas en lista de bitácoras
+  const [anonymizeReport, setAnonymizeReport] = useState(false); // reemplaza nombres por alias en Reporte/CSV
+  const [hideReportPublic, setHideReportPublic] = useState(false); // oculta pestaña Reporte para público (requiere contraseña)
+
   // ========= Cargar desde localStorage =========
   useEffect(() => {
     try {
@@ -154,6 +159,9 @@ export default function App() {
         setSheetsUrl(settings.sheetsUrl ?? ((import.meta.env && import.meta.env.VITE_SHEETS_URL) || ""));
         setAutoSync(settings.autoSync !== undefined ? !!settings.autoSync : true);
         setAutoPull(settings.autoPull !== undefined ? !!settings.autoPull : true);
+        setHideTextDetail(!!settings.hideTextDetail);
+        setAnonymizeReport(!!settings.anonymizeReport);
+        setHideReportPublic(!!settings.hideReportPublic);
       }
     } catch {}
   }, []);
@@ -169,10 +177,10 @@ export default function App() {
   // Guardar ajustes
   useEffect(() => {
     try {
-      const s = { sheetsUrl, autoSync, autoPull };
+      const s = { sheetsUrl, autoSync, autoPull, hideTextDetail, anonymizeReport, hideReportPublic };
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
     } catch {}
-  }, [sheetsUrl, autoSync, autoPull]);
+  }, [sheetsUrl, autoSync, autoPull, hideTextDetail, anonymizeReport, hideReportPublic]);
 
   // ========= Acciones de formulario =========
   const handleTaskChange = (key, field, value) => {
@@ -293,6 +301,18 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ========= Privacidad / anonimización =========
+  const canSeeReport = !hideReportPublic || isSettingsUnlocked || isDashboard;
+
+  const aliasMap = useMemo(() => {
+    const names = Array.from(new Set(entries.map(e => e.personName))).sort((a,b)=> a.localeCompare(b));
+    const m = new Map();
+    names.forEach((n, i) => m.set(n, `Responsable ${i+1}`));
+    return m;
+  }, [entries]);
+
+  const displayName = (name) => anonymizeReport ? (aliasMap.get(name) || 'Responsable') : name;
+
   // ========= Helpers de filtros =========
   const entryHasActivity = (e, actividad) => {
     const t = findTaskByLabel(actividad);
@@ -328,12 +348,13 @@ export default function App() {
   const personData = useMemo(() => {
     const acc = {};
     for (const e of filteredEntries) {
+      const key = displayName(e.personName);
       const total = DEFAULT_TASKS.reduce((s, t) => s + parseN(e.tasks?.[t.key]?.quantity), 0) + (e.otros || []).reduce((s, o) => s + parseN(o.quantity), 0);
-      acc[e.personName] = (acc[e.personName] || 0) + total;
+      acc[key] = (acc[key] || 0) + total;
     }
     return Object.entries(acc).map(([persona, total]) => ({ persona, total }))
       .sort((a,b)=> b.total - a.total);
-  }, [filteredEntries]);
+  }, [filteredEntries, anonymizeReport, aliasMap]);
 
   const trendByDate = useMemo(() => {
     const acc = {};
@@ -346,19 +367,35 @@ export default function App() {
       .sort((a,b)=> a.fecha < b.fecha ? -1 : 1);
   }, [filteredEntries]);
 
+  const matrixByPersonAct = useMemo(() => {
+    const acts = Array.from(new Set([
+      ...DEFAULT_TASKS.map(t => t.label),
+      ...filteredEntries.flatMap(e => (e.otros || []).map(o => o.label || "Otros"))
+    ]));
+    const rows = {};
+    for (const e of filteredEntries) {
+      const name = displayName(e.personName);
+      rows[name] = rows[name] || Object.fromEntries(acts.map(a => [a, 0]));
+      for (const t of DEFAULT_TASKS) rows[name][t.label] += parseN(e.tasks?.[t.key]?.quantity);
+      for (const o of e.otros || []) rows[name][o.label || "Otros"] += parseN(o.quantity);
+    }
+    return { acts, rows };
+  }, [filteredEntries, anonymizeReport, aliasMap]);
+
   // ========= Exportar / Importar =========
   const exportCSVEntries = () => {
     const rows = [];
     rows.push(["Responsable","Fecha (seleccionada)","Registrado (PR)","Actividad","Descripción","Cantidad","Tipo","Notas"]);
     for (const e of entries) {
+      const nameOut = displayName(e.personName);
       for (const t of DEFAULT_TASKS) {
         const te = e.tasks?.[t.key] || { description: "", quantity: "" };
         const qty = parseN(te.quantity);
-        if (qty > 0 || te.description) rows.push([e.personName, fmtDateOnlyPR(e.date), fmtDateTimePR(e.createdAt), t.label, (te.description || "").replace(/\n/g, "; "), String(qty), "Base", (e.notes||"").replace(/\n/g, "; ")]);
+        if (qty > 0 || te.description) rows.push([nameOut, fmtDateOnlyPR(e.date), fmtDateTimePR(e.createdAt), t.label, (te.description || "").replace(/\n/g, "; "), String(qty), "Base", (e.notes||"").replace(/\n/g, "; ")]);
       }
       for (const o of e.otros || []) {
         const qty = parseN(o.quantity);
-        if (qty > 0 || o.description) rows.push([e.personName, fmtDateOnlyPR(e.date), fmtDateTimePR(e.createdAt), o.label || "Otros", (o.description || "").replace(/\n/g, "; "), String(qty), "Otros", (e.notes||"").replace(/\n/g, "; ")]);
+        if (qty > 0 || o.description) rows.push([nameOut, fmtDateOnlyPR(e.date), fmtDateTimePR(e.createdAt), o.label || "Otros", (o.description || "").replace(/\n/g, "; "), String(qty), "Otros", (e.notes||"").replace(/\n/g, "; ")]);
       }
     }
     const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
@@ -391,6 +428,15 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  // ========= Navegación rápida al Reporte desde una bitácora =========
+  const goToReportFor = (e) => {
+    setFilterPerson(e.personName);
+    setFilterStart(e.date);
+    setFilterEnd(e.date);
+    setActivityFilter(null);
+    setView('report');
+  };
+
   // ===================== UI =====================
   return (
     <div
@@ -412,7 +458,9 @@ export default function App() {
             {!isDashboard && (
               <>
                 <button className={`px-3 py-2 rounded-xl border ${view === "form" ? "bg-fuchsia-600 text-white" : "bg-white/80 backdrop-blur border-fuchsia-200"}`} onClick={() => setView("form")}>Formulario</button>
-                <button className={`px-3 py-2 rounded-xl border ${view === "report" ? "bg-fuchsia-600 text-white" : "bg-white/80 backdrop-blur border-fuchsia-200"}`} onClick={() => setView("report")}>Reporte</button>
+                {canSeeReport && (
+                  <button className={`px-3 py-2 rounded-xl border ${view === "report" ? "bg-fuchsia-600 text-white" : "bg-white/80 backdrop-blur border-fuchsia-200"}`} onClick={() => setView("report")}>Reporte</button>
+                )}
                 <button className={`px-3 py-2 rounded-xl border ${view === "settings" ? "bg-rose-600 text-white" : "bg-white/80 backdrop-blur border-rose-200"}`} onClick={() => setView("settings")}>Ajustes</button>
               </>
             )}
@@ -501,121 +549,126 @@ export default function App() {
         {/* REPORT */}
         {view === "report" && (
           <>
-            <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100">
-              <h2 className="text-lg font-semibold mb-3 text-rose-800">Filtros del Reporte</h2>
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-                <div><label className="text-sm">Desde</label><input type="date" className="mt-1 w-full rounded-lg border p-2" value={filterStart} onChange={e => setFilterStart(e.target.value)} /></div>
-                <div><label className="text-sm">Hasta</label><input type="date" className="mt-1 w-full rounded-lg border p-2" value={filterEnd} onChange={e => setFilterEnd(e.target.value)} /></div>
-                <div className="md:col-span-2"><label className="text-sm">Responsable (contiene)</label><input className="mt-1 w-full rounded-lg border p-2" placeholder="Filtrar por nombre" value={filterPerson} onChange={e => setFilterPerson(e.target.value)} /></div>
-              </div>
-              {(activityFilter || filterPerson) && (
-                <div className="mt-3 flex flex-wrap gap-2 text-sm">
-                  {activityFilter && (
-                    <span className="px-2 py-1 rounded-full bg-fuchsia-100 text-fuchsia-800 border border-fuchsia-200">Actividad: {activityFilter} <button className="ml-1 underline" onClick={()=>setActivityFilter(null)}>Quitar</button></span>
+            {!canSeeReport ? (
+              <section className="bg-white/90 backdrop-blur rounded-2xl shadow p-6 border border-rose-200 max-w-xl">
+                <h2 className="text-lg font-semibold mb-2 text-rose-800">Reporte oculto para el público</h2>
+                <p className="text-sm text-gray-700">Para ver el reporte, ingrese a <strong>Ajustes</strong> con contraseña o desactive la opción "Ocultar Reporte al público".</p>
+              </section>
+            ) : (
+              <>
+                <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100">
+                  <h2 className="text-lg font-semibold mb-3 text-rose-800">Filtros del Reporte</h2>
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                    <div><label className="text-sm">Desde</label><input type="date" className="mt-1 w-full rounded-lg border p-2" value={filterStart} onChange={e => setFilterStart(e.target.value)} /></div>
+                    <div><label className="text-sm">Hasta</label><input type="date" className="mt-1 w-full rounded-lg border p-2" value={filterEnd} onChange={e => setFilterEnd(e.target.value)} /></div>
+                    <div className="md:col-span-2">
+                      <label className="text-sm">Responsable {anonymizeReport && <span className="text-xs text-gray-500">(desactivado por anonimización)</span>}</label>
+                      <input className="mt-1 w-full rounded-lg border p-2" placeholder={anonymizeReport ? "Anónimo" : "Filtrar por nombre"} value={anonymizeReport ? "" : filterPerson} onChange={e => !anonymizeReport && setFilterPerson(e.target.value)} readOnly={anonymizeReport} />
+                    </div>
+                  </div>
+                  {(activityFilter || (!anonymizeReport && filterPerson)) && (
+                    <div className="mt-3 flex flex-wrap gap-2 text-sm">
+                      {activityFilter && (
+                        <span className="px-2 py-1 rounded-full bg-fuchsia-100 text-fuchsia-800 border border-fuchsia-200">Actividad: {activityFilter} <button className="ml-1 underline" onClick={()=>setActivityFilter(null)}>Quitar</button></span>
+                      )}
+                      {!anonymizeReport && filterPerson && (
+                        <span className="px-2 py-1 rounded-full bg-rose-100 text-rose-800 border border-rose-200">Responsable: {filterPerson} <button className="ml-1 underline" onClick={()=>setFilterPerson("")}>Quitar</button></span>
+                      )}
+                    </div>
                   )}
-                  {filterPerson && (
-                    <span className="px-2 py-1 rounded-full bg-rose-100 text-rose-800 border border-rose-200">Responsable: {filterPerson} <button className="ml-1 underline" onClick={()=>setFilterPerson("")}>Quitar</button></span>
-                  )}
+                </section>
+
+                <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100" style={{ height: 380 }}>
+                  <h2 className="text-lg font-semibold mb-3 text-rose-800">Actividades por categoría (todas las bitácoras)</h2>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={activityData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="actividad" tick={{ fontSize: 12 }} interval={0} angle={-20} textAnchor="end" height={70} />
+                      <YAxis allowDecimals={false} />
+                      <Tooltip formatter={(value) => [value, 'Cantidad']} />
+                      <Legend />
+                      <Bar dataKey="cantidad" name="Cantidad" isAnimationActive>
+                        {activityData.map((d, i) => (
+                          <Cell key={`cell-act-${d.actividad}`} fill={COLORS[i % COLORS.length]} fillOpacity={activityFilter && activityFilter !== d.actividad ? 0.35 : 1} cursor="pointer" onClick={() => setActivityFilter(d.actividad)} />
+                        ))}
+                      </Bar>
+                      <Brush dataKey="actividad" height={20} travellerWidth={8} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                  <p className="text-xs text-gray-600 mt-2">Sugerencia: haga clic en una barra para filtrar por esa actividad.</p>
+                </section>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100" style={{ height: 340 }}>
+                    <h2 className="text-lg font-semibold mb-3 text-rose-800">Actividades por responsable{anonymizeReport ? " (anónimo)" : ""}</h2>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={personData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey="persona" tick={{ fontSize: 12 }} interval={0} angle={-10} textAnchor="end" height={50} />
+                        <YAxis allowDecimals={false} />
+                        <Tooltip formatter={(value) => [value, 'Total']} />
+                        <Legend />
+                        <Bar dataKey="total" name="Total" isAnimationActive>
+                          {personData.map((d, i) => (
+                            <Cell key={`cell-per-${d.persona}`} fill={COLORS[i % COLORS.length]} cursor="pointer" onClick={() => !anonymizeReport && setFilterPerson(d.persona)} />
+                          ))}
+                        </Bar>
+                        <Brush dataKey="persona" height={20} travellerWidth={8} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                    <p className="text-xs text-gray-600 mt-2">Sugerencia: {anonymizeReport ? 'nombres ocultos' : 'clic en una barra para filtrar por responsable'}.</p>
+                  </section>
+
+                  <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100" style={{ height: 340 }}>
+                    <h2 className="text-lg font-semibold mb-3 text-rose-800">Tendencia por fecha</h2>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={trendByDate} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey="fecha" tickFormatter={(v) => fmtDateOnlyPR(v)} />
+                        <YAxis allowDecimals={false} />
+                        <Tooltip formatter={(value) => [value, 'Total diario']} labelFormatter={(label) => fmtDateOnlyPR(label)} />
+                        <Legend />
+                        <Line type="monotone" dataKey="total" name="Total diario" stroke="#8b5cf6" activeDot={{ r: 6 }} dot={{ r: 2 }} />
+                        <Brush dataKey="fecha" height={20} travellerWidth={8} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </section>
                 </div>
-              )}
-            </section>
 
-            <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100" style={{ height: 380 }}>
-              <h2 className="text-lg font-semibold mb-3 text-rose-800">Actividades por categoría (todas las bitácoras)</h2>
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={activityData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="actividad" tick={{ fontSize: 12 }} interval={0} angle={-20} textAnchor="end" height={70} />
-                  <YAxis allowDecimals={false} />
-                  <Tooltip formatter={(value) => [value, 'Cantidad']} />
-                  <Legend />
-                  <Bar dataKey="cantidad" name="Cantidad" isAnimationActive>
-                    {activityData.map((d, i) => (
-                      <Cell key={`cell-act-${d.actividad}`} fill={COLORS[i % COLORS.length]} fillOpacity={activityFilter && activityFilter !== d.actividad ? 0.35 : 1} cursor="pointer" onClick={() => setActivityFilter(d.actividad)} />
-                    ))}
-                  </Bar>
-                  <Brush dataKey="actividad" height={20} travellerWidth={8} />
-                </BarChart>
-              </ResponsiveContainer>
-              <p className="text-xs text-gray-600 mt-2">Sugerencia: haga clic en una barra para filtrar por esa actividad.</p>
-            </section>
+                <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100 overflow-x-auto">
+                  <h2 className="text-lg font-semibold mb-3 text-rose-800">Detalle por responsable y actividad{anonymizeReport ? " (anónimo)" : ""}</h2>
+                  <div className="min-w-[720px]">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left border-b">
+                          <th className="py-2 pr-3">Responsable</th>
+                          {matrixByPersonAct.acts.map((act, i) => (
+                            <th key={act} className="py-2 px-2 whitespace-nowrap" style={{color: COLORS[i % COLORS.length]}}>{act}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(matrixByPersonAct.rows).map(([persona, acts]) => (
+                          <tr key={persona} className="border-b">
+                            <td className="py-2 pr-3 font-medium whitespace-nowrap">{persona}</td>
+                            {matrixByPersonAct.acts.map((act) => (
+                              <td key={act} className="py-2 px-2 text-right">{acts[act] ? acts[act] : 0}</td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100" style={{ height: 340 }}>
-                <h2 className="text-lg font-semibold mb-3 text-rose-800">Actividades por responsable</h2>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={personData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="persona" tick={{ fontSize: 12 }} interval={0} angle={-10} textAnchor="end" height={50} />
-                    <YAxis allowDecimals={false} />
-                    <Tooltip formatter={(value) => [value, 'Total']} />
-                    <Legend />
-                    <Bar dataKey="total" name="Total" isAnimationActive>
-                      {personData.map((d, i) => (
-                        <Cell key={`cell-per-${d.persona}`} fill={COLORS[i % COLORS.length]} cursor="pointer" onClick={() => setFilterPerson(d.persona)} />
-                      ))}
-                    </Bar>
-                    <Brush dataKey="persona" height={20} travellerWidth={8} />
-                  </BarChart>
-                </ResponsiveContainer>
-                <p className="text-xs text-gray-600 mt-2">Sugerencia: clic en una barra para filtrar por responsable.</p>
-              </section>
-
-              <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100" style={{ height: 340 }}>
-                <h2 className="text-lg font-semibold mb-3 text-rose-800">Tendencia por fecha</h2>
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={trendByDate} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="fecha" tickFormatter={(v) => fmtDateOnlyPR(v)} />
-                    <YAxis allowDecimals={false} />
-                    <Tooltip formatter={(value) => [value, 'Total diario']} labelFormatter={(label) => fmtDateOnlyPR(label)} />
-                    <Legend />
-                    <Line type="monotone" dataKey="total" name="Total diario" stroke="#8b5cf6" activeDot={{ r: 6 }} dot={{ r: 2 }} />
-                    <Brush dataKey="fecha" height={20} travellerWidth={8} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </section>
-            </div>
-
-            <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100 overflow-x-auto">
-              <h2 className="text-lg font-semibold mb-3 text-rose-800">Detalle por responsable y actividad</h2>
-              <div className="min-w-[720px]">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-left border-b">
-                      <th className="py-2 pr-3">Responsable</th>
-                      {Array.from(new Set([
-                        ...DEFAULT_TASKS.map(t => t.label),
-                        ...filteredEntries.flatMap(e => (e.otros || []).map(o => o.label || "Otros"))
-                      ])).map((act, i) => (<th key={act} className="py-2 px-2 whitespace-nowrap" style={{color: COLORS[i % COLORS.length]}}>{act}</th>))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.entries(filteredEntries.reduce((acc, e) => {
-                      acc[e.personName] = acc[e.personName] || {};
-                      for (const t of DEFAULT_TASKS) acc[e.personName][t.label] = (acc[e.personName][t.label] || 0) + parseN(e.tasks?.[t.key]?.quantity);
-                      for (const o of e.otros || []) acc[e.personName][o.label || "Otros"] = (acc[e.personName][o.label || "Otros"] || 0) + parseN(o.quantity);
-                      return acc;
-                    }, {})).map(([persona, acts]) => (
-                      <tr key={persona} className="border-b">
-                        <td className="py-2 pr-3 font-medium whitespace-nowrap">{persona}</td>
-                        {Array.from(new Set([
-                          ...DEFAULT_TASKS.map(t => t.label),
-                          ...filteredEntries.flatMap(e => (e.otros || []).map(o => o.label || "Otros"))
-                        ])).map((act) => (<td key={act} className="py-2 px-2 text-right">{acts[act] ? acts[act] : 0}</td>))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-
-            <div className="flex flex-wrap gap-2">
-              <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => setView("form")}>Volver al formulario</button>
-              <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => window.print()}>Imprimir reporte</button>
-              <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => exportCSVEntries()}>Exportar CSV (todas)</button>
-              <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => exportJSON()}>Exportar respaldo (JSON)</button>
-            </div>
+                <div className="flex flex-wrap gap-2">
+                  <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => setView("form")}>Volver al formulario</button>
+                  <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => window.print()}>Imprimir reporte</button>
+                  <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => exportCSVEntries()}>Exportar CSV (todas)</button>
+                  <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => exportJSON()}>Exportar respaldo (JSON)</button>
+                </div>
+              </>
+            )}
           </>
         )}
 
@@ -670,6 +723,22 @@ export default function App() {
                         <input id="autopull" type="checkbox" checked={autoPull} onChange={(e) => setAutoPull(e.target.checked)} />
                         <label htmlFor="autopull">Cargar automáticamente desde la nube al iniciar</label>
                       </div>
+
+                      <div className="col-span-2 border-t pt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div className="flex items-center gap-2">
+                          <input id="hidetext" type="checkbox" checked={hideTextDetail} onChange={(e)=>setHideTextDetail(e.target.checked)} />
+                          <label htmlFor="hidetext">Ocultar Descripción/Notas en Bitácoras</label>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input id="anon" type="checkbox" checked={anonymizeReport} onChange={(e)=>setAnonymizeReport(e.target.checked)} />
+                          <label htmlFor="anon">Anonimizar nombres en Reporte/CSV</label>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input id="hidereport" type="checkbox" checked={hideReportPublic} onChange={(e)=>setHideReportPublic(e.target.checked)} />
+                          <label htmlFor="hidereport">Ocultar Reporte al público (requiere contraseña)</label>
+                        </div>
+                      </div>
+
                       <div className="col-span-2 text-xs text-gray-700">Estado: {syncStatus || "(sin pruebas aún)"} {usingProxy && "· (Envío vía proxy)"}</div>
                     </div>
                   </section>
@@ -690,13 +759,17 @@ export default function App() {
                             <div className="col-span-12 md:col-span-1 text-sm">Total: {e.total ?? (DEFAULT_TASKS.reduce((s, t) => s + parseN(e.tasks?.[t.key]?.quantity), 0) + (e.otros || []).reduce((s, o) => s + parseN(o.quantity), 0))}</div>
                             <div className="col-span-12 md:col-span-1 text-right flex md:justify-end gap-2">
                               <button className="text-fuchsia-700 underline" onClick={() => setExpanded((p) => ({ ...p, [e.id]: !p[e.id] }))}>{expanded[e.id] ? 'Ocultar' : 'Ver'}</button>
+                              <button className="text-rose-700 underline" onClick={() => goToReportFor(e)}>Ver en Reporte</button>
                               <button className="text-red-600 underline" onClick={() => deleteEntry(e.id)}>Eliminar</button>
                             </div>
                           </div>
-                          <div className="mt-1 text-xs text-gray-700">
-                            <div><span className="font-medium">Descripción:</span> {summarizeDescriptions(e) || "—"}</div>
-                            <div><span className="font-medium">Notas:</span> {snippet(e.notes, 140) || "—"}</div>
-                          </div>
+
+                          {!hideTextDetail && (
+                            <div className="mt-1 text-xs text-gray-700">
+                              <div><span className="font-medium">Descripción:</span> {summarizeDescriptions(e) || "—"}</div>
+                              <div><span className="font-medium">Notas:</span> {snippet(e.notes, 140) || "—"}</div>
+                            </div>
+                          )}
 
                           {expanded[e.id] && (
                             <div className="mt-3 grid grid-cols-1 md:grid-cols-12 gap-3">
@@ -718,7 +791,7 @@ export default function App() {
                                       return (
                                         <tr key={t.key} className="border-b">
                                           <td className="py-1 pr-2 whitespace-nowrap">{t.label}</td>
-                                          <td className="py-1 pr-2">{te.description || "—"}</td>
+                                          <td className="py-1 pr-2">{hideTextDetail ? '—' : (te.description || "—")}</td>
                                           <td className="py-1 pr-2 text-right">{parseN(te.quantity) || 0}</td>
                                         </tr>
                                       );
@@ -726,13 +799,19 @@ export default function App() {
                                     {(e.otros || []).filter(o => o.description || parseN(o.quantity) > 0).map((o, idx) => (
                                       <tr key={`o-${idx}`} className="border-b">
                                         <td className="py-1 pr-2 whitespace-nowrap">{o.label || 'Otros'}</td>
-                                        <td className="py-1 pr-2">{o.description || "—"}</td>
+                                        <td className="py-1 pr-2">{hideTextDetail ? '—' : (o.description || "—")}</td>
                                         <td className="py-1 pr-2 text-right">{parseN(o.quantity) || 0}</td>
                                       </tr>
                                     ))}
                                   </tbody>
                                 </table>
                               </div>
+                              {!hideTextDetail && (
+                                <div className="md:col-span-12">
+                                  <div className="text-sm font-medium text-fuchsia-900 mt-3">Notas / Comentarios</div>
+                                  <div className="text-sm text-gray-800 whitespace-pre-wrap bg-fuchsia-50/60 rounded-lg p-2 border border-fuchsia-100">{e.notes || "—"}</div>
+                                </div>
+                              )}
                             </div>
                           )}
                         </div>
