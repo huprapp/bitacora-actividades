@@ -21,13 +21,13 @@ const DEFAULT_TASKS = [
   { key: "serviciosComunidad", label: "Servicios a la Comunidad" },
 ];
 
-const STORAGE_KEY = "bitacora_actividades_app_v4"; // dataset local (opcional)
+const STORAGE_KEY = "bitacora_actividades_app_v3"; // dataset local (opcional)
 const SETTINGS_KEY = "bitacora_settings_v2"; // prefs de la UI (con autoPull y password)
 const OUTBOX_KEY = "bitacora_outbox_v1"; // cola offline para reintentos
 
 // Seguridad sencilla para Ajustes
 const REQUIRE_SETTINGS_PASSWORD = true; // activar bloqueo básico
-const SETTINGS_PASSWORD_DEFAULT = "social2025"; // puedes cambiarlo en .env
+const SETTINGS_PASSWORD_DEFAULT = "social2025"; // puedes cambiarlo
 const SETTINGS_PASSWORD = (import.meta.env && import.meta.env.VITE_SETTINGS_PASSWORD) || SETTINGS_PASSWORD_DEFAULT;
 
 // Paleta viva para barras / series
@@ -37,7 +37,7 @@ const COLORS = [
   "#a855f7", "#f97316", "#14b8a6", "#eab308"
 ];
 
-// Zona horaria Puerto Rico
+// Zona horaria Puerto Rico y formateadores de fecha/hora
 const TZ = "America/Puerto_Rico";
 const fmtDateTimePR = (iso) => {
   if (!iso) return "";
@@ -49,6 +49,20 @@ const fmtDateTimePR = (iso) => {
       timeStyle: 'short'
     }).format(d);
   } catch { return String(iso); }
+};
+const fmtDateOnlyPR = (val) => {
+  if (!val) return '';
+  try {
+    let d;
+    if (typeof val === 'string' && val.length === 10 && val[4] === '-' && val[7] === '-') {
+      const [y,m,dd] = val.split('-').map(Number);
+      // Mediodía UTC para evitar corrimientos por zona horaria
+      d = new Date(Date.UTC(y, m-1, dd, 12, 0, 0));
+    } else {
+      d = new Date(val);
+    }
+    return new Intl.DateTimeFormat('es-PR', { timeZone: TZ, dateStyle: 'medium' }).format(d);
+  } catch { return String(val); }
 };
 
 const parseN = (v) => {
@@ -86,13 +100,10 @@ export default function App() {
 
   // Dataset histórico (múltiples días/personas)
   const [entries, setEntries] = useState([]);
-  const [expanded, setExpanded] = useState({}); // filas expandibles
+  const [expanded, setExpanded] = useState({}); // filas expandibles en tabla del formulario
 
-  // Vista principal
+  // Vista
   const [view, setView] = useState("form"); // "form" | "report" | "settings"
-
-  // Sub-pestañas en Ajustes
-  const [settingsTab, setSettingsTab] = useState("config"); // "config" | "bitacoras"
 
   // Filtros del reporte
   const [filterStart, setFilterStart] = useState("");
@@ -100,14 +111,14 @@ export default function App() {
   const [filterPerson, setFilterPerson] = useState("");
 
   // Interactividad de gráficas
-  const [activityFilter, setActivityFilter] = useState(null);
+  const [activityFilter, setActivityFilter] = useState(null); // filtra reporte por categoría clickeada
 
   // Ajustes y estado
   const [sheetsUrl, setSheetsUrl] = useState((import.meta.env && import.meta.env.VITE_SHEETS_URL) || "");
   const [autoSync, setAutoSync] = useState(true); // ON por defecto
   const [autoPull, setAutoPull] = useState(true); // auto-cargar nube al iniciar
   const [syncStatus, setSyncStatus] = useState("");
-  const usingProxy = true; // proxy / Netlify Function
+  const usingProxy = true; // esta versión usa el proxy / Netlify Function
   const isDashboard = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('dashboard') === '1';
   const fileInputRef = useRef(null);
 
@@ -115,7 +126,7 @@ export default function App() {
   const [isSettingsUnlocked, setIsSettingsUnlocked] = useState(false);
   const [passInput, setPassInput] = useState("");
 
-  // ========= Cargar desde localStorage =========
+  // ========= Cargar desde localStorage (si está disponible) =========
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
@@ -142,7 +153,7 @@ export default function App() {
     } catch {}
   }, []);
 
-  // Guardado local (dataset + form actual)
+  // Guardado local (opcional)
   useEffect(() => {
     try {
       const payload = { entries, current: { personName, date, notes, tasks, otros } };
@@ -180,19 +191,18 @@ export default function App() {
 
   const saveEntry = async () => {
     if (!personName || !date) { alert("Por favor complete Nombre del Responsable y Fecha."); return; }
-    // Validación de fecha futura (usa local)
+    // Validación de fecha futura
     try {
       const today = new Date(); today.setHours(23,59,59,999);
       if (new Date(date) > today) { alert('La fecha no puede ser futura.'); return; }
     } catch {}
 
-    const createdAt = new Date().toISOString();
-    const newEntry = { id: uuid(), personName, date, notes, tasks, otros, total: currentTotals.total, createdAt };
+    const newEntry = { id: uuid(), personName, date, notes, tasks, otros, total: currentTotals.total, createdAt: new Date().toISOString() };
 
-    // 1) Guardar local
+    // 1) Guardar local (si el navegador lo permite)
     setEntries((prev) => [...prev, newEntry]);
 
-    // 2) Enviar a la nube (proxy)
+    // 2) Enviar a la nube (proxy function)
     if (autoSync) {
       try {
         await pushToSheets([newEntry]);
@@ -203,7 +213,7 @@ export default function App() {
       }
     }
 
-    // 3) Limpiar campos operativos
+    // 3) Limpiar campos operativos (no borro nombre/fecha por UX, pero puedes hacerlo)
     setNotes("");
     setTasks(Object.fromEntries(DEFAULT_TASKS.map((t) => [t.key, { description: "", quantity: "" }])));
     setOtros([{ label: "Otros", description: "", quantity: "" }]);
@@ -213,6 +223,7 @@ export default function App() {
 
   // ========= Sincronización (PROXY por Netlify Function) =========
   const pushToSheets = async (items) => {
+    // Llamamos a la Function del mismo sitio: evita CORS y restricciones de dominio
     const resp = await fetch('/.netlify/functions/submit', {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -333,16 +344,16 @@ export default function App() {
   // ========= Exportar / Importar =========
   const exportCSVEntries = () => {
     const rows = [];
-    rows.push(["Nombre del Responsable", "Fecha (seleccionada)", "Registrado (PR)", "Actividad", "Descripción", "Cantidad", "Tipo", "Notas"]);
+    rows.push(["Responsable","Fecha (seleccionada)","Registrado (PR)","Actividad","Descripción","Cantidad","Tipo","Notas"]);
     for (const e of entries) {
       for (const t of DEFAULT_TASKS) {
         const te = e.tasks?.[t.key] || { description: "", quantity: "" };
         const qty = parseN(te.quantity);
-        if (qty > 0 || te.description) rows.push([e.personName, e.date, fmtDateTimePR(e.createdAt), t.label, (te.description || "").replace(/\n/g, "; "), String(qty), "Base", (e.notes||"").replace(/\n/g, "; ")]);
+        if (qty > 0 || te.description) rows.push([e.personName, fmtDateOnlyPR(e.date), fmtDateTimePR(e.createdAt), t.label, (te.description || "").replace(/\n/g, "; "), String(qty), "Base", (e.notes||"").replace(/\n/g, "; ")]);
       }
       for (const o of e.otros || []) {
         const qty = parseN(o.quantity);
-        if (qty > 0 || o.description) rows.push([e.personName, e.date, fmtDateTimePR(e.createdAt), o.label || "Otros", (o.description || "").replace(/\n/g, "; "), String(qty), "Otros", (e.notes||"").replace(/\n/g, "; ")]);
+        if (qty > 0 || o.description) rows.push([e.personName, fmtDateOnlyPR(e.date), fmtDateTimePR(e.createdAt), o.label || "Otros", (o.description || "").replace(/\n/g, "; "), String(qty), "Otros", (e.notes||"").replace(/\n/g, "; ")]);
       }
     }
     const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
@@ -406,7 +417,7 @@ export default function App() {
           </div>
         </header>
 
-        {/* FORM (sin lista de bitácoras aquí) */}
+        {/* FORM */}
         {view === "form" && !isDashboard && (
           <>
             <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-fuchsia-100">
@@ -479,6 +490,74 @@ export default function App() {
                 <p className="text-xs text-gray-700">{syncStatus}</p>
               </div>
             </section>
+
+            {entries.length > 0 && (
+              <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-fuchsia-100">
+                <h2 className="text-lg font-semibold mb-3 text-fuchsia-800">Bitácoras guardadas ({entries.length})</h2>
+
+                <div className="space-y-2">
+                  {entries.slice().reverse().map((e) => (
+                    <div key={e.id} className="border rounded-xl p-3 bg-white/90">
+                      <div className="grid grid-cols-12 gap-2 items-center">
+                        <div className="col-span-12 md:col-span-3 text-sm"><span className="font-semibold text-fuchsia-900">{e.personName}</span></div>
+                        <div className="col-span-6 md:col-span-2 text-sm">Fecha: {fmtDateOnlyPR(e.date) || '—'}<br className="hidden md:block" />Registrado (PR): {fmtDateTimePR(e.createdAt) || '—'}</div>
+                        <div className="col-span-6 md:col-span-2 text-sm">Total: {e.total ?? (DEFAULT_TASKS.reduce((s, t) => s + parseN(e.tasks?.[t.key]?.quantity), 0) + (e.otros || []).reduce((s, o) => s + parseN(o.quantity), 0))}</div>
+                        <div className="col-span-12 md:col-span-4 text-xs text-gray-700">
+                          <div><span className="font-medium">Descripción:</span> {summarizeDescriptions(e) || "—"}</div>
+                          <div><span className="font-medium">Notas:</span> {snippet(e.notes, 140) || "—"}</div>
+                        </div>
+                        <div className="col-span-12 md:col-span-1 text-right flex md:justify-end gap-2">
+                          <button className="text-fuchsia-700 underline" onClick={() => setExpanded((p) => ({ ...p, [e.id]: !p[e.id] }))}>{expanded[e.id] ? 'Ocultar' : 'Ver'}</button>
+                          <button className="text-red-600 underline" onClick={() => deleteEntry(e.id)}>Eliminar</button>
+                        </div>
+                      </div>
+
+                      {expanded[e.id] && (
+                        <div className="mt-3 grid grid-cols-1 md:grid-cols-12 gap-3">
+                          <div className="md:col-span-12">
+                            <div className="text-sm font-medium text-fuchsia-900">Detalle de actividades</div>
+                            <table className="w-full text-sm mt-2">
+                              <thead>
+                                <tr className="text-left border-b">
+                                  <th className="py-1 pr-2">Actividad</th>
+                                  <th className="py-1 pr-2">Descripción</th>
+                                  <th className="py-1 pr-2 text-right">Cantidad</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {DEFAULT_TASKS.map((t) => {
+                                  const te = e.tasks?.[t.key] || { description: "", quantity: "" };
+                                  const show = te.description || parseN(te.quantity) > 0;
+                                  if (!show) return null;
+                                  return (
+                                    <tr key={t.key} className="border-b">
+                                      <td className="py-1 pr-2 whitespace-nowrap">{t.label}</td>
+                                      <td className="py-1 pr-2">{te.description || "—"}</td>
+                                      <td className="py-1 pr-2 text-right">{parseN(te.quantity) || 0}</td>
+                                    </tr>
+                                  );
+                                })}
+                                {(e.otros || []).filter(o => o.description || parseN(o.quantity) > 0).map((o, idx) => (
+                                  <tr key={`o-${idx}`} className="border-b">
+                                    <td className="py-1 pr-2 whitespace-nowrap">{o.label || 'Otros'}</td>
+                                    <td className="py-1 pr-2">{o.description || "—"}</td>
+                                    <td className="py-1 pr-2 text-right">{parseN(o.quantity) || 0}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          <div className="md:col-span-12">
+                            <div className="text-sm font-medium text-fuchsia-900 mt-3">Notas / Comentarios</div>
+                            <div className="text-sm text-gray-800 whitespace-pre-wrap bg-fuchsia-50/60 rounded-lg p-2 border border-fuchsia-100">{e.notes || "—"}</div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
           </>
         )}
 
@@ -550,9 +629,9 @@ export default function App() {
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={trendByDate} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="fecha" />
+                    <XAxis dataKey="fecha" tickFormatter={(v) => fmtDateOnlyPR(v)} />
                     <YAxis allowDecimals={false} />
-                    <Tooltip formatter={(value) => [value, 'Total diario']} />
+                    <Tooltip formatter={(value) => [value, 'Total diario']} labelFormatter={(label) => fmtDateOnlyPR(label)} />
                     <Legend />
                     <Line type="monotone" dataKey="total" name="Total diario" stroke="#8b5cf6" activeDot={{ r: 6 }} dot={{ r: 2 }} />
                     <Brush dataKey="fecha" height={20} travellerWidth={8} />
@@ -603,7 +682,7 @@ export default function App() {
           </>
         )}
 
-        {/* SETTINGS con pestañas internas */}
+        {/* SETTINGS */}
         {view === "settings" && !isDashboard && (
           <>
             {!isSettingsUnlocked && REQUIRE_SETTINGS_PASSWORD ? (
@@ -621,120 +700,44 @@ export default function App() {
               </section>
             ) : (
               <>
-                {/* Tabs */}
-                <div className="bg-white/80 backdrop-blur rounded-2xl shadow p-2 border border-rose-100 flex gap-2">
-                  <button className={`px-3 py-2 rounded-xl border ${settingsTab === 'config' ? 'bg-rose-600 text-white' : 'bg-white'}`} onClick={()=>setSettingsTab('config')}>Configuración</button>
-                  <button className={`px-3 py-2 rounded-xl border ${settingsTab === 'bitacoras' ? 'bg-rose-600 text-white' : 'bg-white'}`} onClick={()=>setSettingsTab('bitacoras')}>Bitácoras guardadas</button>
-                  <div className="ml-auto flex items-center">
-                    <button className="text-rose-700 underline text-sm" onClick={()=>{ setIsSettingsUnlocked(false); setPassInput(''); }}>Bloquear ajustes</button>
+                <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100">
+                  <h2 className="text-lg font-semibold mb-3 text-rose-800">Ajustes y Sincronización</h2>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-sm">URL de Google Apps Script (informativa)</label>
+                      <input className="mt-1 w-full rounded-lg border p-2" placeholder="(opcional)" value={sheetsUrl} onChange={e => setSheetsUrl(e.target.value)} />
+                      <p className="text-xs text-gray-500 mt-1">Esta versión envía usando un <strong>proxy del sitio</strong> (Netlify Function). Este campo es informativo.</p>
+                    </div>
+                    <div className="flex flex-wrap items-end gap-2">
+                      <button className="px-3 py-2 rounded-xl border bg-white" onClick={testSheets}>Probar conexión</button>
+                      <button className="px-3 py-2 rounded-xl border bg-white" onClick={retryOutbox}>Enviar cola pendiente</button>
+                      <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => pullFromCloud('merge')}>Cargar desde la nube (combinar)</button>
+                      <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => pullFromCloud('replace')}>Reemplazar con la nube</button>
+                    </div>
+                    <div className="col-span-1 flex items-center gap-2">
+                      <input id="autosync" type="checkbox" checked={autoSync} onChange={(e) => setAutoSync(e.target.checked)} />
+                      <label htmlFor="autosync">Sincronizar automáticamente al Guardar bitácora</label>
+                    </div>
+                    <div className="col-span-1 flex items-center gap-2">
+                      <input id="autopull" type="checkbox" checked={autoPull} onChange={(e) => setAutoPull(e.target.checked)} />
+                      <label htmlFor="autopull">Cargar automáticamente desde la nube al iniciar</label>
+                    </div>
+                    <div className="col-span-2 flex items-center justify-between text-xs text-gray-700">
+                      <p>Estado: {syncStatus || "(sin pruebas aún)"} {usingProxy && "· (Envío vía proxy)"}</p>
+                      <button className="text-rose-700 underline" onClick={()=>{ setIsSettingsUnlocked(false); setPassInput(""); }}>Bloquear ajustes</button>
+                    </div>
                   </div>
-                </div>
+                </section>
 
-                {/* Panel: Configuración */}
-                {settingsTab === 'config' && (
-                  <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100">
-                    <h2 className="text-lg font-semibold mb-3 text-rose-800">Ajustes y Sincronización</h2>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div>
-                        <label className="text-sm">URL de Google Apps Script (informativa)</label>
-                        <input className="mt-1 w-full rounded-lg border p-2" placeholder="(opcional)" value={sheetsUrl} onChange={e => setSheetsUrl(e.target.value)} />
-                        <p className="text-xs text-gray-500 mt-1">Esta versión envía usando un <strong>proxy del sitio</strong> (Netlify Function). Este campo es informativo.</p>
-                      </div>
-                      <div className="flex flex-wrap items-end gap-2">
-                        <button className="px-3 py-2 rounded-xl border bg-white" onClick={testSheets}>Probar conexión</button>
-                        <button className="px-3 py-2 rounded-xl border bg-white" onClick={retryOutbox}>Enviar cola pendiente</button>
-                        <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => pullFromCloud('merge')}>Cargar desde la nube (combinar)</button>
-                        <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => pullFromCloud('replace')}>Reemplazar con la nube</button>
-                      </div>
-                      <div className="col-span-1 flex items-center gap-2">
-                        <input id="autosync" type="checkbox" checked={autoSync} onChange={(e) => setAutoSync(e.target.checked)} />
-                        <label htmlFor="autosync">Sincronizar automáticamente al Guardar bitácora</label>
-                      </div>
-                      <div className="col-span-1 flex items-center gap-2">
-                        <input id="autopull" type="checkbox" checked={autoPull} onChange={(e) => setAutoPull(e.target.checked)} />
-                        <label htmlFor="autopull">Cargar automáticamente desde la nube al iniciar</label>
-                      </div>
-                      <div className="col-span-2 text-xs text-gray-700">Estado: {syncStatus || "(sin pruebas aún)"} {usingProxy && "· (Envío vía proxy)"}</div>
-                    </div>
-                  </section>
-                )}
-
-                {/* Panel: Bitácoras guardadas */}
-                {settingsTab === 'bitacoras' && (
-                  <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100">
-                    <h2 className="text-lg font-semibold mb-3 text-rose-800">Bitácoras guardadas ({entries.length})</h2>
-
-                    <div className="space-y-2">
-                      {entries.slice().reverse().map((e) => (
-                        <div key={e.id} className="border rounded-xl p-3 bg-white/90">
-                          <div className="grid grid-cols-12 gap-2 items-center">
-                            <div className="col-span-12 md:col-span-3 text-sm"><span className="font-semibold text-fuchsia-900">{e.personName}</span></div>
-                            <div className="col-span-6 md:col-span-2 text-sm">Fecha: {e.date || '—'}</div>
-                            <div className="col-span-6 md:col-span-3 text-sm">Registrado (PR): {fmtDateTimePR(e.createdAt) || '—'}</div>
-                            <div className="col-span-12 md:col-span-3 text-sm">Total: {e.total ?? (DEFAULT_TASKS.reduce((s, t) => s + parseN(e.tasks?.[t.key]?.quantity), 0) + (e.otros || []).reduce((s, o) => s + parseN(o.quantity), 0))}</div>
-                            <div className="col-span-12 md:col-span-1 text-right flex md:justify-end gap-2">
-                              <button className="text-fuchsia-700 underline" onClick={() => setExpanded((p) => ({ ...p, [e.id]: !p[e.id] }))}>{expanded[e.id] ? 'Ocultar' : 'Ver'}</button>
-                              <button className="text-red-600 underline" onClick={() => deleteEntry(e.id)}>Eliminar</button>
-                            </div>
-                          </div>
-                          <div className="mt-1 text-xs text-gray-700">
-                            <div><span className="font-medium">Descripción:</span> {summarizeDescriptions(e) || "—"}</div>
-                            <div><span className="font-medium">Notas:</span> {snippet(e.notes, 140) || "—"}</div>
-                          </div>
-
-                          {expanded[e.id] && (
-                            <div className="mt-3 grid grid-cols-1 md:grid-cols-12 gap-3">
-                              <div className="md:col-span-12">
-                                <div className="text-sm font-medium text-fuchsia-900">Detalle de actividades</div>
-                                <table className="w-full text-sm mt-2">
-                                  <thead>
-                                    <tr className="text-left border-b">
-                                      <th className="py-1 pr-2">Actividad</th>
-                                      <th className="py-1 pr-2">Descripción</th>
-                                      <th className="py-1 pr-2 text-right">Cantidad</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {DEFAULT_TASKS.map((t) => {
-                                      const te = e.tasks?.[t.key] || { description: "", quantity: "" };
-                                      const show = te.description || parseN(te.quantity) > 0;
-                                      if (!show) return null;
-                                      return (
-                                        <tr key={t.key} className="border-b">
-                                          <td className="py-1 pr-2 whitespace-nowrap">{t.label}</td>
-                                          <td className="py-1 pr-2">{te.description || "—"}</td>
-                                          <td className="py-1 pr-2 text-right">{parseN(te.quantity) || 0}</td>
-                                        </tr>
-                                      );
-                                    })}
-                                    {(e.otros || []).filter(o => o.description || parseN(o.quantity) > 0).map((o, idx) => (
-                                      <tr key={`o-${idx}`} className="border-b">
-                                        <td className="py-1 pr-2 whitespace-nowrap">{o.label || 'Otros'}</td>
-                                        <td className="py-1 pr-2">{o.description || "—"}</td>
-                                        <td className="py-1 pr-2 text-right">{parseN(o.quantity) || 0}</td>
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </div>
-                              <div className="md:col-span-12">
-                                <div className="text-sm font-medium text-fuchsia-900 mt-3">Notas / Comentarios</div>
-                                <div className="text-sm text-gray-800 whitespace-pre-wrap bg-fuchsia-50/60 rounded-lg p-2 border border-fuchsia-100">{e.notes || "—"}</div>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="mt-4 flex flex-wrap gap-2">
-                      <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => exportCSVEntries()}>Exportar CSV (todas)</button>
-                      <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => exportJSON()}>Exportar respaldo (JSON)</button>
-                      <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) importJSON(f); e.target.value = ""; }} />
-                      <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => fileInputRef.current?.click()}>Importar respaldo (JSON)</button>
-                    </div>
-                  </section>
-                )}
+                <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100">
+                  <h3 className="text-base font-semibold mb-2 text-rose-800">Respaldos locales</h3>
+                  <div className="flex flex-wrap gap-2">
+                    <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => exportJSON()}>Exportar respaldo (JSON)</button>
+                    <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) importJSON(f); e.target.value = ""; }} />
+                    <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => fileInputRef.current?.click()}>Importar respaldo (JSON)</button>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-2">Si el navegador borra datos locales, use la sincronización (proxy) o exporte respaldos.</p>
+                </section>
               </>
             )}
           </>
