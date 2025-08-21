@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
-  LineChart, Line, ResponsiveContainer
+  LineChart, Line, ResponsiveContainer, Brush, Cell
 } from "recharts";
 
 // ===================== CONFIG =====================
@@ -22,14 +22,42 @@ const DEFAULT_TASKS = [
 ];
 
 const STORAGE_KEY = "bitacora_actividades_app_v3"; // dataset local (opcional)
-const SETTINGS_KEY = "bitacora_settings_v1"; // prefs de la UI
+const SETTINGS_KEY = "bitacora_settings_v2"; // prefs de la UI (con autoPull y password)
 const OUTBOX_KEY = "bitacora_outbox_v1"; // cola offline para reintentos
+
+// Seguridad sencilla para Ajustes
+const REQUIRE_SETTINGS_PASSWORD = true; // activar bloqueo básico
+const SETTINGS_PASSWORD_DEFAULT = "social2025"; // puedes cambiarlo
+const SETTINGS_PASSWORD = (import.meta.env && import.meta.env.VITE_SETTINGS_PASSWORD) || SETTINGS_PASSWORD_DEFAULT;
+
+// Paleta viva para barras / series
+const COLORS = [
+  "#8b5cf6", "#ec4899", "#06b6d4", "#10b981",
+  "#f59e0b", "#ef4444", "#22c55e", "#3b82f6",
+  "#a855f7", "#f97316", "#14b8a6", "#eab308"
+];
 
 const parseN = (v) => {
   const n = Number(String(v ?? "").toString().replace(",", "."));
   return Number.isFinite(n) ? n : 0;
 };
 const uuid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+const snippet = (txt, n = 120) => (txt || "").replace(/\s+/g, " ").trim().slice(0, n) + ((txt || "").length > n ? "…" : "");
+
+const summarizeDescriptions = (e) => {
+  const parts = [];
+  for (const t of DEFAULT_TASKS) {
+    const d = (e.tasks?.[t.key]?.description || "").trim();
+    if (d) parts.push(`${t.label}: ${d}`);
+  }
+  for (const o of e.otros || []) {
+    const d = (o.description || "").trim();
+    if (d) parts.push(`${o.label || 'Otros'}: ${d}`);
+  }
+  return snippet(parts.join(' · '), 140);
+};
+
+const findTaskByLabel = (label) => DEFAULT_TASKS.find(t => t.label === label);
 
 // ===================== APP =====================
 export default function App() {
@@ -44,6 +72,7 @@ export default function App() {
 
   // Dataset histórico (múltiples días/personas)
   const [entries, setEntries] = useState([]);
+  const [expanded, setExpanded] = useState({}); // filas expandibles en tabla del formulario
 
   // Vista
   const [view, setView] = useState("form"); // "form" | "report" | "settings"
@@ -53,12 +82,21 @@ export default function App() {
   const [filterEnd, setFilterEnd] = useState("");
   const [filterPerson, setFilterPerson] = useState("");
 
+  // Interactividad de gráficas
+  const [activityFilter, setActivityFilter] = useState(null); // filtra reporte por categoría clickeada
+
   // Ajustes y estado
   const [sheetsUrl, setSheetsUrl] = useState((import.meta.env && import.meta.env.VITE_SHEETS_URL) || "");
   const [autoSync, setAutoSync] = useState(true); // ON por defecto
+  const [autoPull, setAutoPull] = useState(true); // auto-cargar nube al iniciar
   const [syncStatus, setSyncStatus] = useState("");
   const usingProxy = true; // esta versión usa el proxy / Netlify Function
+  const isDashboard = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('dashboard') === '1';
   const fileInputRef = useRef(null);
+
+  // Seguridad ajustes
+  const [isSettingsUnlocked, setIsSettingsUnlocked] = useState(false);
+  const [passInput, setPassInput] = useState("");
 
   // ========= Cargar desde localStorage (si está disponible) =========
   useEffect(() => {
@@ -82,6 +120,7 @@ export default function App() {
       if (settings) {
         setSheetsUrl(settings.sheetsUrl ?? ((import.meta.env && import.meta.env.VITE_SHEETS_URL) || ""));
         setAutoSync(settings.autoSync !== undefined ? !!settings.autoSync : true);
+        setAutoPull(settings.autoPull !== undefined ? !!settings.autoPull : true);
       }
     } catch {}
   }, []);
@@ -97,10 +136,10 @@ export default function App() {
   // Guardar ajustes
   useEffect(() => {
     try {
-      const s = { sheetsUrl, autoSync };
+      const s = { sheetsUrl, autoSync, autoPull };
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
     } catch {}
-  }, [sheetsUrl, autoSync]);
+  }, [sheetsUrl, autoSync, autoPull]);
 
   // ========= Acciones de formulario =========
   const handleTaskChange = (key, field, value) => {
@@ -124,6 +163,12 @@ export default function App() {
 
   const saveEntry = async () => {
     if (!personName || !date) { alert("Por favor complete Nombre del Responsable y Fecha."); return; }
+    // Validación de fecha futura
+    try {
+      const today = new Date(); today.setHours(23,59,59,999);
+      if (new Date(date) > today) { alert('La fecha no puede ser futura.'); return; }
+    } catch {}
+
     const newEntry = { id: uuid(), personName, date, notes, tasks, otros, total: currentTotals.total, createdAt: new Date().toISOString() };
 
     // 1) Guardar local (si el navegador lo permite)
@@ -157,8 +202,6 @@ export default function App() {
       body: JSON.stringify({ type: 'bitacoras', entries: items })
     });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    // Si tu Apps Script responde JSON, podrías validar aquí:
-    // const data = await resp.json(); if (!data.ok) throw new Error('Apps Script error');
     return true;
   };
 
@@ -210,15 +253,54 @@ export default function App() {
     }
   };
 
+  // Auto-pull al iniciar (si está activo) + modo dashboard abre reporte
+  useEffect(() => {
+    if (autoPull) pullFromCloud('merge').catch(() => {});
+    if (isDashboard) setView('report');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ========= Helpers de filtros =========
+  const entryHasActivity = (e, actividad) => {
+    const t = findTaskByLabel(actividad);
+    if (t) {
+      const te = e.tasks?.[t.key] || {};
+      return !!(parseN(te.quantity) > 0 || (te.description || '').trim());
+    }
+    // otros
+    return (e.otros || []).some(o => (o.label || 'Otros') === actividad && (parseN(o.quantity) > 0 || (o.description || '').trim()));
+  };
+
   // ========= Agregaciones para Reporte =========
   const filteredEntries = useMemo(() => {
     return entries.filter((e) => {
       const matchPerson = filterPerson ? e.personName.toLowerCase().includes(filterPerson.toLowerCase()) : true;
       const matchStart = filterStart ? e.date >= filterStart : true;
       const matchEnd = filterEnd ? e.date <= filterEnd : true;
-      return matchPerson && matchStart && matchEnd;
+      const matchActivity = activityFilter ? entryHasActivity(e, activityFilter) : true;
+      return matchPerson && matchStart && matchEnd && matchActivity;
     });
-  }, [entries, filterStart, filterEnd, filterPerson]);
+  }, [entries, filterStart, filterEnd, filterPerson, activityFilter]);
+
+  const activityData = useMemo(() => {
+    const acc = {};
+    for (const e of filteredEntries) {
+      for (const t of DEFAULT_TASKS) acc[t.label] = (acc[t.label] || 0) + parseN(e.tasks?.[t.key]?.quantity);
+      for (const o of e.otros || []) acc[o.label || "Otros"] = (acc[o.label || "Otros"] || 0) + parseN(o.quantity);
+    }
+    return Object.entries(acc).map(([actividad, cantidad]) => ({ actividad, cantidad }))
+      .sort((a,b)=> b.cantidad - a.cantidad);
+  }, [filteredEntries]);
+
+  const personData = useMemo(() => {
+    const acc = {};
+    for (const e of filteredEntries) {
+      const total = DEFAULT_TASKS.reduce((s, t) => s + parseN(e.tasks?.[t.key]?.quantity), 0) + (e.otros || []).reduce((s, o) => s + parseN(o.quantity), 0);
+      acc[e.personName] = (acc[e.personName] || 0) + total;
+    }
+    return Object.entries(acc).map(([persona, total]) => ({ persona, total }))
+      .sort((a,b)=> b.total - a.total);
+  }, [filteredEntries]);
 
   const trendByDate = useMemo(() => {
     const acc = {};
@@ -227,22 +309,23 @@ export default function App() {
       const sumOtros = (e.otros || []).reduce((s, o) => s + parseN(o.quantity), 0);
       acc[e.date] = (acc[e.date] || 0) + sumTasks + sumOtros;
     }
-    return Object.entries(acc).map(([fecha, total]) => ({ fecha, total })).sort((a,b)=>a.fecha<b.fecha?-1:1);
+    return Object.entries(acc).map(([fecha, total]) => ({ fecha, total }))
+      .sort((a,b)=> a.fecha < b.fecha ? -1 : 1);
   }, [filteredEntries]);
 
   // ========= Exportar / Importar =========
   const exportCSVEntries = () => {
     const rows = [];
-    rows.push(["Nombre del Responsable", "Fecha", "Actividad", "Descripción", "Cantidad", "Tipo"]);
+    rows.push(["Nombre del Responsable", "Fecha", "Actividad", "Descripción", "Cantidad", "Tipo", "Notas"]);
     for (const e of entries) {
       for (const t of DEFAULT_TASKS) {
         const te = e.tasks?.[t.key] || { description: "", quantity: "" };
         const qty = parseN(te.quantity);
-        if (qty > 0 || te.description) rows.push([e.personName, e.date, t.label, (te.description || "").replace(/\n/g, "; "), String(qty), "Base"]);
+        if (qty > 0 || te.description) rows.push([e.personName, e.date, t.label, (te.description || "").replace(/\n/g, "; "), String(qty), "Base", (e.notes||"").replace(/\n/g, "; ")]);
       }
       for (const o of e.otros || []) {
         const qty = parseN(o.quantity);
-        if (qty > 0 || o.description) rows.push([e.personName, e.date, o.label || "Otros", (o.description || "").replace(/\n/g, "; "), String(qty), "Otros"]);
+        if (qty > 0 || o.description) rows.push([e.personName, e.date, o.label || "Otros", (o.description || "").replace(/\n/g, "; "), String(qty), "Otros", (e.notes||"").replace(/\n/g, "; ")]);
       }
     }
     const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
@@ -277,25 +360,40 @@ export default function App() {
 
   // ===================== UI =====================
   return (
-    <div className="min-h-screen w-full bg-gray-50 p-4 md:p-8">
+    <div
+      className="min-h-screen w-full bg-gradient-to-br from-cyan-50 via-sky-50 to-fuchsia-50 p-4 md:p-8"
+      style={{
+        backgroundImage: 'url(/bg-trabajo-social.jpg), linear-gradient(135deg, #ecfeff 0%, #fdf2f8 100%)',
+        backgroundSize: 'cover',
+        backgroundPosition: 'center',
+        backgroundAttachment: 'fixed'
+      }}
+    >
       <div className="mx-auto max-w-7xl space-y-6">
         <header className="flex items-center justify-between gap-4">
           <div>
-            <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">Hospital UPR Dr. Federico Trilla</h1>
-            <p className="text-sm md:text-base text-gray-600">Bitácora de Actividades (General) — con respaldo y sincronización</p>
+            <h1 className="text-2xl md:text-3xl font-semibold tracking-tight text-fuchsia-700">Trabajo Social — Bitácora General</h1>
+            <p className="text-sm md:text-base text-fuchsia-800/80">Registro y monitoreo con respaldo en la nube</p>
           </div>
           <div className="flex gap-2">
-            <button className={`px-3 py-2 rounded-xl border ${view === "form" ? "bg-blue-600 text-white" : "bg-white"}`} onClick={() => setView("form")}>Formulario</button>
-            <button className={`px-3 py-2 rounded-xl border ${view === "report" ? "bg-blue-600 text-white" : "bg-white"}`} onClick={() => setView("report")}>Reporte</button>
-            <button className={`px-3 py-2 rounded-xl border ${view === "settings" ? "bg-blue-600 text-white" : "bg-white"}`} onClick={() => setView("settings")}>Ajustes</button>
+            {!isDashboard && (
+              <>
+                <button className={`px-3 py-2 rounded-xl border ${view === "form" ? "bg-fuchsia-600 text-white" : "bg-white/80 backdrop-blur border-fuchsia-200"}`} onClick={() => setView("form")}>Formulario</button>
+                <button className={`px-3 py-2 rounded-xl border ${view === "report" ? "bg-fuchsia-600 text-white" : "bg-white/80 backdrop-blur border-fuchsia-200"}`} onClick={() => setView("report")}>Reporte</button>
+                <button className={`px-3 py-2 rounded-xl border ${view === "settings" ? "bg-rose-600 text-white" : "bg-white/80 backdrop-blur border-rose-200"}`} onClick={() => setView("settings")}>Ajustes</button>
+              </>
+            )}
+            {isDashboard && (
+              <button className="px-3 py-2 rounded-xl border bg-white/80 backdrop-blur" onClick={() => pullFromCloud('merge')}>Actualizar ahora</button>
+            )}
           </div>
         </header>
 
         {/* FORM */}
-        {view === "form" && (
+        {view === "form" && !isDashboard && (
           <>
-            <section className="bg-white rounded-2xl shadow p-4">
-              <h2 className="text-lg font-semibold mb-3">Datos del Registro</h2>
+            <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-fuchsia-100">
+              <h2 className="text-lg font-semibold mb-3 text-fuchsia-800">Datos del Registro</h2>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="col-span-2">
                   <label className="text-sm">Nombre del Responsable</label>
@@ -308,12 +406,12 @@ export default function App() {
               </div>
             </section>
 
-            <section className="bg-white rounded-2xl shadow p-4">
-              <h2 className="text-lg font-semibold mb-3">Registro de Actividades</h2>
+            <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-fuchsia-100">
+              <h2 className="text-lg font-semibold mb-3 text-fuchsia-800">Registro de Actividades</h2>
               <div className="space-y-6">
                 {DEFAULT_TASKS.map((t) => (
                   <div key={t.key} className="grid grid-cols-1 md:grid-cols-12 gap-3 items-start border rounded-2xl p-3">
-                    <div className="md:col-span-3"><div className="text-sm font-medium">{t.label}</div></div>
+                    <div className="md:col-span-3"><div className="text-sm font-medium text-fuchsia-900">{t.label}</div></div>
                     <div className="md:col-span-7">
                       <label className="text-xs text-gray-600">Descripción de lo realizado</label>
                       <textarea className="mt-1 w-full rounded-lg border p-2" rows={3} value={tasks[t.key]?.description || ""} onChange={e => handleTaskChange(t.key, "description", e.target.value)} placeholder="Escriba aquí las actividades realizadas" />
@@ -347,45 +445,86 @@ export default function App() {
                   </div>
                 ))}
 
+                <section className="bg-white/80 backdrop-blur rounded-2xl border p-3">
+                  <h3 className="text-base font-semibold mb-2 text-fuchsia-800">Notas / Comentarios del registro</h3>
+                  <textarea className="w-full rounded-lg border p-2" rows={4} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Observaciones relevantes, logros, incidencias, etc." />
+                </section>
+
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                   <KPI title="Total (Base)" value={DEFAULT_TASKS.reduce((acc, t) => acc + parseN(tasks[t.key]?.quantity), 0)} />
                   <KPI title="Total (Otros)" value={otros.reduce((acc, o) => acc + parseN(o.quantity), 0)} />
                   <KPI title="TOTAL REGISTRO" value={currentTotals.total} />
-                  <div className="rounded-2xl border bg-white p-4 flex items-center justify-center">
-                    <button className="px-3 py-2 rounded-xl border bg-blue-600 text-white w-full" onClick={saveEntry}>Guardar bitácora</button>
+                  <div className="rounded-2xl border bg-gradient-to-r from-fuchsia-600 to-rose-600 text-white p-4 flex items-center justify-center">
+                    <button className="px-3 py-2 rounded-xl border border-white/20 bg-white/10 hover:bg-white/20 w-full" onClick={saveEntry}>Guardar bitácora</button>
                   </div>
                 </div>
 
-                <p className="text-xs text-gray-600">{syncStatus}</p>
+                <p className="text-xs text-gray-700">{syncStatus}</p>
               </div>
             </section>
 
-            <section className="bg-white rounded-2xl shadow p-4">
-              <h2 className="text-lg font-semibold mb-3">Notas / Comentarios</h2>
-              <textarea className="w-full rounded-lg border p-2" rows={4} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Observaciones relevantes, logros, incidencias, etc." />
-            </section>
-
-            <div className="flex flex-wrap gap-2">
-              <button className="px-3 py-2 rounded-xl border bg-white" onClick={resetForm}>Limpiar</button>
-              <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => exportJSON()}>Exportar respaldo (JSON)</button>
-              <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => exportCSVEntries()}>Exportar CSV (todas)</button>
-              <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => window.print()}>Imprimir</button>
-              <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) importJSON(f); e.target.value = ""; }} />
-              <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => fileInputRef.current?.click()}>Importar respaldo (JSON)</button>
-            </div>
-
             {entries.length > 0 && (
-              <section className="bg-white rounded-2xl shadow p-4">
-                <h2 className="text-lg font-semibold mb-3">Bitácoras guardadas ({entries.length})</h2>
+              <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-fuchsia-100">
+                <h2 className="text-lg font-semibold mb-3 text-fuchsia-800">Bitácoras guardadas ({entries.length})</h2>
+
                 <div className="space-y-2">
                   {entries.slice().reverse().map((e) => (
-                    <div key={e.id} className="grid grid-cols-12 gap-2 items-center border rounded-xl p-3">
-                      <div className="col-span-12 md:col-span-4 text-sm"><span className="font-medium">{e.personName}</span></div>
-                      <div className="col-span-6 md:col-span-3 text-sm">{e.date}</div>
-                      <div className="col-span-4 md:col-span-3 text-sm">Total: {e.total ?? (DEFAULT_TASKS.reduce((s, t) => s + parseN(e.tasks?.[t.key]?.quantity), 0) + (e.otros || []).reduce((s, o) => s + parseN(o.quantity), 0))}</div>
-                      <div className="col-span-2 md:col-span-2 text-right">
-                        <button className="text-red-600 underline" onClick={() => deleteEntry(e.id)}>Eliminar</button>
+                    <div key={e.id} className="border rounded-xl p-3 bg-white/90">
+                      <div className="grid grid-cols-12 gap-2 items-center">
+                        <div className="col-span-12 md:col-span-3 text-sm"><span className="font-semibold text-fuchsia-900">{e.personName}</span></div>
+                        <div className="col-span-6 md:col-span-2 text-sm">{e.date}</div>
+                        <div className="col-span-6 md:col-span-2 text-sm">Total: {e.total ?? (DEFAULT_TASKS.reduce((s, t) => s + parseN(e.tasks?.[t.key]?.quantity), 0) + (e.otros || []).reduce((s, o) => s + parseN(o.quantity), 0))}</div>
+                        <div className="col-span-12 md:col-span-4 text-xs text-gray-700">
+                          <div><span className="font-medium">Descripción:</span> {summarizeDescriptions(e) || "—"}</div>
+                          <div><span className="font-medium">Notas:</span> {snippet(e.notes, 140) || "—"}</div>
+                        </div>
+                        <div className="col-span-12 md:col-span-1 text-right flex md:justify-end gap-2">
+                          <button className="text-fuchsia-700 underline" onClick={() => setExpanded((p) => ({ ...p, [e.id]: !p[e.id] }))}>{expanded[e.id] ? 'Ocultar' : 'Ver'}</button>
+                          <button className="text-red-600 underline" onClick={() => deleteEntry(e.id)}>Eliminar</button>
+                        </div>
                       </div>
+
+                      {expanded[e.id] && (
+                        <div className="mt-3 grid grid-cols-1 md:grid-cols-12 gap-3">
+                          <div className="md:col-span-12">
+                            <div className="text-sm font-medium text-fuchsia-900">Detalle de actividades</div>
+                            <table className="w-full text-sm mt-2">
+                              <thead>
+                                <tr className="text-left border-b">
+                                  <th className="py-1 pr-2">Actividad</th>
+                                  <th className="py-1 pr-2">Descripción</th>
+                                  <th className="py-1 pr-2 text-right">Cantidad</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {DEFAULT_TASKS.map((t) => {
+                                  const te = e.tasks?.[t.key] || { description: "", quantity: "" };
+                                  const show = te.description || parseN(te.quantity) > 0;
+                                  if (!show) return null;
+                                  return (
+                                    <tr key={t.key} className="border-b">
+                                      <td className="py-1 pr-2 whitespace-nowrap">{t.label}</td>
+                                      <td className="py-1 pr-2">{te.description || "—"}</td>
+                                      <td className="py-1 pr-2 text-right">{parseN(te.quantity) || 0}</td>
+                                    </tr>
+                                  );
+                                })}
+                                {(e.otros || []).filter(o => o.description || parseN(o.quantity) > 0).map((o, idx) => (
+                                  <tr key={`o-${idx}`} className="border-b">
+                                    <td className="py-1 pr-2 whitespace-nowrap">{o.label || 'Otros'}</td>
+                                    <td className="py-1 pr-2">{o.description || "—"}</td>
+                                    <td className="py-1 pr-2 text-right">{parseN(o.quantity) || 0}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          <div className="md:col-span-12">
+                            <div className="text-sm font-medium text-fuchsia-900 mt-3">Notas / Comentarios</div>
+                            <div className="text-sm text-gray-800 whitespace-pre-wrap bg-fuchsia-50/60 rounded-lg p-2 border border-fuchsia-100">{e.notes || "—"}</div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -397,64 +536,84 @@ export default function App() {
         {/* REPORT */}
         {view === "report" && (
           <>
-            <section className="bg-white rounded-2xl shadow p-4">
-              <h2 className="text-lg font-semibold mb-3">Filtros del Reporte</h2>
+            <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100">
+              <h2 className="text-lg font-semibold mb-3 text-rose-800">Filtros del Reporte</h2>
               <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
                 <div><label className="text-sm">Desde</label><input type="date" className="mt-1 w-full rounded-lg border p-2" value={filterStart} onChange={e => setFilterStart(e.target.value)} /></div>
                 <div><label className="text-sm">Hasta</label><input type="date" className="mt-1 w-full rounded-lg border p-2" value={filterEnd} onChange={e => setFilterEnd(e.target.value)} /></div>
                 <div className="md:col-span-2"><label className="text-sm">Responsable (contiene)</label><input className="mt-1 w-full rounded-lg border p-2" placeholder="Filtrar por nombre" value={filterPerson} onChange={e => setFilterPerson(e.target.value)} /></div>
               </div>
+              {(activityFilter || filterPerson) && (
+                <div className="mt-3 flex flex-wrap gap-2 text-sm">
+                  {activityFilter && (
+                    <span className="px-2 py-1 rounded-full bg-fuchsia-100 text-fuchsia-800 border border-fuchsia-200">Actividad: {activityFilter} <button className="ml-1 underline" onClick={()=>setActivityFilter(null)}>Quitar</button></span>
+                  )}
+                  {filterPerson && (
+                    <span className="px-2 py-1 rounded-full bg-rose-100 text-rose-800 border border-rose-200">Responsable: {filterPerson} <button className="ml-1 underline" onClick={()=>setFilterPerson("")}>Quitar</button></span>
+                  )}
+                </div>
+              )}
             </section>
 
-            <section className="bg-white rounded-2xl shadow p-4" style={{ height: 360 }}>
-              <h2 className="text-lg font-semibold mb-3">Actividades por categoría (todas las bitácoras)</h2>
+            <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100" style={{ height: 380 }}>
+              <h2 className="text-lg font-semibold mb-3 text-rose-800">Actividades por categoría (todas las bitácoras)</h2>
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={Object.entries(filteredEntries.length ? filteredEntries.reduce((acc, e) => {
-                  for (const t of DEFAULT_TASKS) acc[t.label] = (acc[t.label] || 0) + parseN(e.tasks?.[t.key]?.quantity);
-                  for (const o of e.otros || []) acc[o.label || "Otros"] = (acc[o.label || "Otros"] || 0) + parseN(o.quantity);
-                  return acc; }, {}) : {}).map(([actividad, cantidad]) => ({ actividad, cantidad }))} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                <BarChart data={activityData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="actividad" tick={{ fontSize: 12 }} interval={0} angle={-20} textAnchor="end" height={70} />
                   <YAxis allowDecimals={false} />
-                  <Tooltip />
+                  <Tooltip formatter={(value) => [value, 'Cantidad']} />
                   <Legend />
-                  <Bar dataKey="cantidad" name="Cantidad" />
+                  <Bar dataKey="cantidad" name="Cantidad" isAnimationActive>
+                    {activityData.map((d, i) => (
+                      <Cell key={`cell-act-${d.actividad}`} fill={COLORS[i % COLORS.length]} fillOpacity={activityFilter && activityFilter !== d.actividad ? 0.35 : 1} cursor="pointer" onClick={() => setActivityFilter(d.actividad)} />
+                    ))}
+                  </Bar>
+                  <Brush dataKey="actividad" height={20} travellerWidth={8} />
                 </BarChart>
               </ResponsiveContainer>
+              <p className="text-xs text-gray-600 mt-2">Sugerencia: haga clic en una barra para filtrar por esa actividad.</p>
             </section>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <section className="bg-white rounded-2xl shadow p-4" style={{ height: 320 }}>
-                <h2 className="text-lg font-semibold mb-3">Actividades por responsable</h2>
+              <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100" style={{ height: 340 }}>
+                <h2 className="text-lg font-semibold mb-3 text-rose-800">Actividades por responsable</h2>
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={Object.entries(filteredEntries.reduce((acc, e) => { const total = DEFAULT_TASKS.reduce((s, t) => s + parseN(e.tasks?.[t.key]?.quantity), 0) + (e.otros || []).reduce((s, o) => s + parseN(o.quantity), 0); acc[e.personName] = (acc[e.personName] || 0) + total; return acc; }, {})).map(([persona, total]) => ({ persona, total })).sort((a, b) => b.total - a.total)} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                  <BarChart data={personData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis dataKey="persona" tick={{ fontSize: 12 }} interval={0} angle={-10} textAnchor="end" height={50} />
                     <YAxis allowDecimals={false} />
-                    <Tooltip />
+                    <Tooltip formatter={(value) => [value, 'Total']} />
                     <Legend />
-                    <Bar dataKey="total" name="Total" />
+                    <Bar dataKey="total" name="Total" isAnimationActive>
+                      {personData.map((d, i) => (
+                        <Cell key={`cell-per-${d.persona}`} fill={COLORS[i % COLORS.length]} cursor="pointer" onClick={() => setFilterPerson(d.persona)} />
+                      ))}
+                    </Bar>
+                    <Brush dataKey="persona" height={20} travellerWidth={8} />
                   </BarChart>
                 </ResponsiveContainer>
+                <p className="text-xs text-gray-600 mt-2">Sugerencia: clic en una barra para filtrar por responsable.</p>
               </section>
 
-              <section className="bg-white rounded-2xl shadow p-4" style={{ height: 320 }}>
-                <h2 className="text-lg font-semibold mb-3">Tendencia por fecha</h2>
+              <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100" style={{ height: 340 }}>
+                <h2 className="text-lg font-semibold mb-3 text-rose-800">Tendencia por fecha</h2>
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={trendByDate} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" />
                     <XAxis dataKey="fecha" />
                     <YAxis allowDecimals={false} />
-                    <Tooltip />
+                    <Tooltip formatter={(value) => [value, 'Total diario']} />
                     <Legend />
-                    <Line type="monotone" dataKey="total" name="Total diario" />
+                    <Line type="monotone" dataKey="total" name="Total diario" stroke="#8b5cf6" activeDot={{ r: 6 }} dot={{ r: 2 }} />
+                    <Brush dataKey="fecha" height={20} travellerWidth={8} />
                   </LineChart>
                 </ResponsiveContainer>
               </section>
             </div>
 
-            <section className="bg-white rounded-2xl shadow p-4 overflow-x-auto">
-              <h2 className="text-lg font-semibold mb-3">Detalle por responsable y actividad</h2>
+            <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100 overflow-x-auto">
+              <h2 className="text-lg font-semibold mb-3 text-rose-800">Detalle por responsable y actividad</h2>
               <div className="min-w-[720px]">
                 <table className="w-full text-sm">
                   <thead>
@@ -463,7 +622,7 @@ export default function App() {
                       {Array.from(new Set([
                         ...DEFAULT_TASKS.map(t => t.label),
                         ...filteredEntries.flatMap(e => (e.otros || []).map(o => o.label || "Otros"))
-                      ])).map((act) => (<th key={act} className="py-2 px-2 whitespace-nowrap">{act}</th>))}
+                      ])).map((act, i) => (<th key={act} className="py-2 px-2 whitespace-nowrap" style={{color: COLORS[i % COLORS.length]}}>{act}</th>))}
                     </tr>
                   </thead>
                   <tbody>
@@ -487,50 +646,72 @@ export default function App() {
             </section>
 
             <div className="flex flex-wrap gap-2">
-              <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => setView("form")}>Volver al formulario</button>
-              <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => window.print()}>Imprimir reporte</button>
-              <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => exportCSVEntries()}>Exportar CSV (todas)</button>
-              <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => exportJSON()}>Exportar respaldo (JSON)</button>
+              <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => setView("form")}>Volver al formulario</button>
+              <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => window.print()}>Imprimir reporte</button>
+              <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => exportCSVEntries()}>Exportar CSV (todas)</button>
+              <button className="px-3 py-2 rounded-xl border bg-white/80" onClick={() => exportJSON()}>Exportar respaldo (JSON)</button>
             </div>
           </>
         )}
 
         {/* SETTINGS */}
-        {view === "settings" && (
+        {view === "settings" && !isDashboard && (
           <>
-            <section className="bg-white rounded-2xl shadow p-4">
-              <h2 className="text-lg font-semibold mb-3">Ajustes y Sincronización</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <label className="text-sm">URL de Google Apps Script (informativa)</label>
-                  <input className="mt-1 w-full rounded-lg border p-2" placeholder="(opcional)" value={sheetsUrl} onChange={e => setSheetsUrl(e.target.value)} />
-                  <p className="text-xs text-gray-500 mt-1">Esta versión envía usando un <strong>proxy del sitio</strong> (Netlify Function). Este campo es informativo.</p>
+            {!isSettingsUnlocked && REQUIRE_SETTINGS_PASSWORD ? (
+              <section className="bg-white/90 backdrop-blur rounded-2xl shadow p-6 border border-rose-200 max-w-lg">
+                <h2 className="text-lg font-semibold mb-2 text-rose-800">Acceso a Ajustes</h2>
+                <p className="text-sm text-gray-700 mb-3">Ingrese la contraseña para modificar la configuración.</p>
+                <div className="flex gap-2">
+                  <input type="password" className="w-full rounded-lg border p-2" placeholder="Contraseña" value={passInput} onChange={(e)=>setPassInput(e.target.value)} />
+                  <button className="px-3 py-2 rounded-xl border bg-rose-600 text-white" onClick={()=>{
+                    if (!SETTINGS_PASSWORD) { alert('No hay contraseña configurada. Defina VITE_SETTINGS_PASSWORD en Netlify.'); return; }
+                    if (passInput === SETTINGS_PASSWORD) setIsSettingsUnlocked(true); else alert('Contraseña incorrecta');
+                  }}>Entrar</button>
                 </div>
-                <div className="flex flex-wrap items-end gap-2">
-                  <button className="px-3 py-2 rounded-xl border bg-white" onClick={testSheets}>Probar conexión</button>
-                  <button className="px-3 py-2 rounded-xl border bg-white" onClick={retryOutbox}>Enviar cola pendiente</button>
-                  <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => pullFromCloud('merge')}>Cargar desde la nube (combinar)</button>
-                  <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => pullFromCloud('replace')}>Reemplazar con la nube</button>
-                </div>
-                <div className="col-span-1 flex items-center gap-2">
-                  <input id="autosync" type="checkbox" checked={autoSync} onChange={(e) => setAutoSync(e.target.checked)} />
-                  <label htmlFor="autosync">Sincronizar automáticamente al Guardar bitácora</label>
-                </div>
-                <div className="col-span-1">
-                  <p className="text-xs text-gray-600">Estado: {syncStatus || "(sin pruebas aún)"} {usingProxy && "· (Envío vía proxy)"}</p>
-                </div>
-              </div>
-            </section>
+                <p className="text-xs text-gray-600 mt-2">Admin: configure la variable <code>VITE_SETTINGS_PASSWORD</code> en Netlify para mayor seguridad.</p>
+              </section>
+            ) : (
+              <>
+                <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100">
+                  <h2 className="text-lg font-semibold mb-3 text-rose-800">Ajustes y Sincronización</h2>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-sm">URL de Google Apps Script (informativa)</label>
+                      <input className="mt-1 w-full rounded-lg border p-2" placeholder="(opcional)" value={sheetsUrl} onChange={e => setSheetsUrl(e.target.value)} />
+                      <p className="text-xs text-gray-500 mt-1">Esta versión envía usando un <strong>proxy del sitio</strong> (Netlify Function). Este campo es informativo.</p>
+                    </div>
+                    <div className="flex flex-wrap items-end gap-2">
+                      <button className="px-3 py-2 rounded-xl border bg-white" onClick={testSheets}>Probar conexión</button>
+                      <button className="px-3 py-2 rounded-xl border bg-white" onClick={retryOutbox}>Enviar cola pendiente</button>
+                      <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => pullFromCloud('merge')}>Cargar desde la nube (combinar)</button>
+                      <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => pullFromCloud('replace')}>Reemplazar con la nube</button>
+                    </div>
+                    <div className="col-span-1 flex items-center gap-2">
+                      <input id="autosync" type="checkbox" checked={autoSync} onChange={(e) => setAutoSync(e.target.checked)} />
+                      <label htmlFor="autosync">Sincronizar automáticamente al Guardar bitácora</label>
+                    </div>
+                    <div className="col-span-1 flex items-center gap-2">
+                      <input id="autopull" type="checkbox" checked={autoPull} onChange={(e) => setAutoPull(e.target.checked)} />
+                      <label htmlFor="autopull">Cargar automáticamente desde la nube al iniciar</label>
+                    </div>
+                    <div className="col-span-2 flex items-center justify-between text-xs text-gray-700">
+                      <p>Estado: {syncStatus || "(sin pruebas aún)"} {usingProxy && "· (Envío vía proxy)"}</p>
+                      <button className="text-rose-700 underline" onClick={()=>{ setIsSettingsUnlocked(false); setPassInput(""); }}>Bloquear ajustes</button>
+                    </div>
+                  </div>
+                </section>
 
-            <section className="bg-white rounded-2xl shadow p-4">
-              <h3 className="text-base font-semibold mb-2">Respaldos locales</h3>
-              <div className="flex flex-wrap gap-2">
-                <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => exportJSON()}>Exportar respaldo (JSON)</button>
-                <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) importJSON(f); e.target.value = ""; }} />
-                <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => fileInputRef.current?.click()}>Importar respaldo (JSON)</button>
-              </div>
-              <p className="text-xs text-gray-500 mt-2">Si el navegador borra datos locales, use la sincronización (proxy) o exporte respaldos.</p>
-            </section>
+                <section className="bg-white/80 backdrop-blur rounded-2xl shadow p-4 border border-rose-100">
+                  <h3 className="text-base font-semibold mb-2 text-rose-800">Respaldos locales</h3>
+                  <div className="flex flex-wrap gap-2">
+                    <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => exportJSON()}>Exportar respaldo (JSON)</button>
+                    <input ref={fileInputRef} type="file" accept="application/json" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) importJSON(f); e.target.value = ""; }} />
+                    <button className="px-3 py-2 rounded-xl border bg-white" onClick={() => fileInputRef.current?.click()}>Importar respaldo (JSON)</button>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-2">Si el navegador borra datos locales, use la sincronización (proxy) o exporte respaldos.</p>
+                </section>
+              </>
+            )}
           </>
         )}
       </div>
@@ -548,9 +729,9 @@ export default function App() {
 
 function KPI({ title, value }) {
   return (
-    <div className="rounded-2xl border bg-white p-4">
-      <p className="text-sm text-gray-600">{title}</p>
-      <p className="text-2xl font-semibold">{value}</p>
+    <div className="rounded-2xl border bg-white/90 p-4">
+      <p className="text-sm text-gray-700">{title}</p>
+      <p className="text-2xl font-semibold text-fuchsia-800">{value}</p>
     </div>
   );
 }
